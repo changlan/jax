@@ -22,7 +22,7 @@ from jax import dtypes
 from jax import lax
 from jax._src.lib import xla_client
 from jax._src.util import safe_zip
-from jax._src.numpy.util import check_arraylike, implements, promote_dtypes_inexact
+from jax._src.numpy.util import check_arraylike, promote_dtypes_inexact
 from jax._src.numpy import lax_numpy as jnp
 from jax._src.numpy import ufuncs, reductions
 from jax._src.sharding import Sharding
@@ -45,7 +45,7 @@ def _fft_norm(s: Array, func_name: str, norm: str) -> Array:
                     '"ortho" or "forward".')
 
 
-def _fft_core(func_name: str, fft_type: xla_client.FftType, a: ArrayLike,
+def _fft_core(func_name: str, fft_type: lax.FftType, a: ArrayLike,
               s: Shape | None, axes: Sequence[int] | None,
               norm: str | None) -> Array:
   full_name = f"jax.numpy.fft.{func_name}"
@@ -72,12 +72,6 @@ def _fft_core(func_name: str, fft_type: xla_client.FftType, a: ArrayLike,
     raise ValueError(
         f"{full_name} does not support repeated axes. Got axes {axes}.")
 
-  if len(axes) > 3:
-    # XLA does not support FFTs over more than 3 dimensions
-    raise ValueError(
-        "%s only supports 1D, 2D, and 3D FFTs. "
-        "Got axes %s with input rank %s." % (full_name, orig_axes, arr.ndim))
-
   # XLA only supports FFTs over the innermost axes, so rearrange if necessary.
   if orig_axes is not None:
     axes = tuple(range(arr.ndim - len(axes), arr.ndim))
@@ -87,20 +81,20 @@ def _fft_core(func_name: str, fft_type: xla_client.FftType, a: ArrayLike,
     in_s = list(arr.shape)
     for axis, x in safe_zip(axes, s):
       in_s[axis] = x
-    if fft_type == xla_client.FftType.IRFFT:
+    if fft_type == lax.FftType.IRFFT:
       in_s[-1] = (in_s[-1] // 2 + 1)
     # Cropping
     arr = arr[tuple(map(slice, in_s))]
     # Padding
     arr = jnp.pad(arr, [(0, x-y) for x, y in zip(in_s, arr.shape)])
   else:
-    if fft_type == xla_client.FftType.IRFFT:
+    if fft_type == lax.FftType.IRFFT:
       s = [arr.shape[axis] for axis in axes[:-1]]
       if axes:
         s += [max(0, 2 * (arr.shape[axes[-1]] - 1))]
     else:
       s = [arr.shape[axis] for axis in axes]
-  transformed = lax.fft(arr, fft_type, tuple(s))
+  transformed = _fft_core_nd(arr, fft_type, s)
   if norm is not None:
     transformed *= _fft_norm(
         jnp.array(s, dtype=transformed.dtype), func_name, norm)
@@ -108,6 +102,31 @@ def _fft_core(func_name: str, fft_type: xla_client.FftType, a: ArrayLike,
   if orig_axes is not None:
     transformed = jnp.moveaxis(transformed, axes, orig_axes)
   return transformed
+
+
+def _fft_core_nd(arr: Array, fft_type: lax.FftType, s: Shape) -> Array:
+  # XLA supports N-D transforms up to N=3 so we use XLA's FFT N-D directly.
+  if len(s) <= 3:
+    return lax.fft(arr, fft_type, tuple(s))
+
+  # For larger N, we repeatedly apply N<=3 transforms until we reach the
+  # requested dimension. We special case N=4 to use two 2-D transforms instead
+  # of one 3-D and one 1-D, since we typically expect better accelerator
+  # performance when N>1.
+  n = 2 if len(s) == 4 else 3
+  src = tuple(range(arr.ndim - len(s), arr.ndim - n))
+  dst = tuple(range(arr.ndim - len(s) + n, arr.ndim))
+  if fft_type in {lax.FftType.RFFT, lax.FftType.FFT}:
+    arr = lax.fft(arr, fft_type, tuple(s)[-n:])
+    arr = jnp.moveaxis(arr, src, dst)
+    arr = _fft_core_nd(arr, lax.FftType.FFT, s[:-n])
+    arr = jnp.moveaxis(arr, dst, src)
+  else:
+    arr = jnp.moveaxis(arr, src, dst)
+    arr = _fft_core_nd(arr, lax.FftType.IFFT, s[:-n])
+    arr = jnp.moveaxis(arr, dst, src)
+    arr = lax.fft(arr, fft_type, tuple(s)[-n:])
+  return arr
 
 
 def fftn(a: ArrayLike, s: Shape | None = None,
@@ -181,7 +200,7 @@ def fftn(a: ArrayLike, s: Shape | None = None,
     >>> jnp.allclose(x, jnp.fft.ifftn(x_fftn))
     Array(True, dtype=bool)
   """
-  return _fft_core('fftn', xla_client.FftType.FFT, a, s, axes, norm)
+  return _fft_core('fftn', lax.FftType.FFT, a, s, axes, norm)
 
 
 def ifftn(a: ArrayLike, s: Shape | None = None,
@@ -249,7 +268,7 @@ def ifftn(a: ArrayLike, s: Shape | None = None,
     [[ 2.5 +0.j    0.  -0.58j  0.  +0.58j]
      [ 0.17+0.j   -0.83-0.29j -0.83+0.29j]]
   """
-  return _fft_core('ifftn', xla_client.FftType.IFFT, a, s, axes, norm)
+  return _fft_core('ifftn', lax.FftType.IFFT, a, s, axes, norm)
 
 
 def rfftn(a: ArrayLike, s: Shape | None = None,
@@ -340,7 +359,7 @@ def rfftn(a: ArrayLike, s: Shape | None = None,
     >>> jnp.fft.rfftn(x1)
     Array([10.+0.j, -2.+2.j, -2.+0.j], dtype=complex64)
   """
-  return _fft_core('rfftn', xla_client.FftType.RFFT, a, s, axes, norm)
+  return _fft_core('rfftn', lax.FftType.RFFT, a, s, axes, norm)
 
 
 def irfftn(a: ArrayLike, s: Shape | None = None,
@@ -417,7 +436,7 @@ def irfftn(a: ArrayLike, s: Shape | None = None,
            [[-2., -2., -2.],
             [-2., -2., -2.]]], dtype=float32)
   """
-  return _fft_core('irfftn', xla_client.FftType.IRFFT, a, s, axes, norm)
+  return _fft_core('irfftn', lax.FftType.IRFFT, a, s, axes, norm)
 
 
 def _axis_check_1d(func_name: str, axis: int | None):
@@ -428,7 +447,7 @@ def _axis_check_1d(func_name: str, axis: int | None):
         "Got axis = %r." % (full_name, full_name, axis)
     )
 
-def _fft_core_1d(func_name: str, fft_type: xla_client.FftType,
+def _fft_core_1d(func_name: str, fft_type: lax.FftType,
                  a: ArrayLike, n: int | None, axis: int | None,
                  norm: str | None) -> Array:
   _axis_check_1d(func_name, axis)
@@ -496,7 +515,7 @@ def fft(a: ArrayLike, n: int | None = None,
     >>> jnp.allclose(x, jnp.fft.ifft(x_fft))
     Array(True, dtype=bool)
   """
-  return _fft_core_1d('fft', xla_client.FftType.FFT, a, n=n, axis=axis,
+  return _fft_core_1d('fft', lax.FftType.FFT, a, n=n, axis=axis,
                       norm=norm)
 
 
@@ -552,7 +571,7 @@ def ifft(a: ArrayLike, n: int | None = None,
      [ 0.67+0.58j -0.5 +1.44j  0.17+2.02j  1.83+0.29j]
      [ 0.67-0.58j -0.5 -1.44j  0.17-2.02j  1.83-0.29j]]
   """
-  return _fft_core_1d('ifft', xla_client.FftType.IFFT, a, n=n, axis=axis,
+  return _fft_core_1d('ifft', lax.FftType.IFFT, a, n=n, axis=axis,
                       norm=norm)
 
 
@@ -613,7 +632,7 @@ def rfft(a: ArrayLike, n: int | None = None,
            [ 1.-2.j,  3.-4.j,  5.-6.j],
            [-1.+0.j, -1.+0.j, -1.+0.j]], dtype=complex64)
   """
-  return _fft_core_1d('rfft', xla_client.FftType.RFFT, a, n=n, axis=axis,
+  return _fft_core_1d('rfft', lax.FftType.RFFT, a, n=n, axis=axis,
                       norm=norm)
 
 
@@ -673,7 +692,7 @@ def irfft(a: ArrayLike, n: int | None = None,
            [-0.75, -1.25, -1.75],
            [ 0.25,  0.75,  1.25]], dtype=float32)
   """
-  return _fft_core_1d('irfft', xla_client.FftType.IRFFT, a, n=n, axis=axis,
+  return _fft_core_1d('irfft', lax.FftType.IRFFT, a, n=n, axis=axis,
                       norm=norm)
 
 
@@ -763,7 +782,7 @@ def hfft(a: ArrayLike, n: int | None = None,
   conj_a = ufuncs.conj(a)
   _axis_check_1d('hfft', axis)
   nn = (conj_a.shape[axis] - 1) * 2 if n is None else n
-  return _fft_core_1d('hfft', xla_client.FftType.IRFFT, conj_a, n=n, axis=axis,
+  return _fft_core_1d('hfft', lax.FftType.IRFFT, conj_a, n=n, axis=axis,
                       norm=norm) * nn
 
 
@@ -813,12 +832,12 @@ def ihfft(a: ArrayLike, n: int | None = None,
   _axis_check_1d('ihfft', axis)
   arr = jnp.asarray(a)
   nn = arr.shape[axis] if n is None else n
-  output = _fft_core_1d('ihfft', xla_client.FftType.RFFT, arr, n=n, axis=axis,
+  output = _fft_core_1d('ihfft', lax.FftType.RFFT, arr, n=n, axis=axis,
                         norm=norm)
   return ufuncs.conj(output) * (1 / nn)
 
 
-def _fft_core_2d(func_name: str, fft_type: xla_client.FftType, a: ArrayLike,
+def _fft_core_2d(func_name: str, fft_type: lax.FftType, a: ArrayLike,
                  s: Shape | None, axes: Sequence[int],
                  norm: str | None) -> Array:
   full_name = f"jax.numpy.fft.{func_name}"
@@ -905,7 +924,7 @@ def fft2(a: ArrayLike, s: Shape | None = None, axes: Sequence[int] = (-2,-1),
     >>> jnp.allclose(x, jnp.fft.ifft2(x_fft2))
     Array(True, dtype=bool)
   """
-  return _fft_core_2d('fft2', xla_client.FftType.FFT, a, s=s, axes=axes,
+  return _fft_core_2d('fft2', lax.FftType.FFT, a, s=s, axes=axes,
                       norm=norm)
 
 
@@ -977,7 +996,7 @@ def ifft2(a: ArrayLike, s: Shape | None = None, axes: Sequence[int] = (-2,-1),
             [-0.33-0.58j, -0.33-0.58j],
             [-0.33+0.58j, -0.33+0.58j]]], dtype=complex64)
   """
-  return _fft_core_2d('ifft2', xla_client.FftType.IFFT, a, s=s, axes=axes,
+  return _fft_core_2d('ifft2', lax.FftType.IFFT, a, s=s, axes=axes,
                       norm=norm)
 
 
@@ -1056,7 +1075,7 @@ def rfft2(a: ArrayLike, s: Shape | None = None, axes: Sequence[int] = (-2,-1),
             [  3.47+10.11j,   6.43+11.42j,   9.38+12.74j],
             [  3.19 +1.63j,   4.4  +1.38j,   5.61 +1.12j]]], dtype=complex64)
   """
-  return _fft_core_2d('rfft2', xla_client.FftType.RFFT, a, s=s, axes=axes,
+  return _fft_core_2d('rfft2', lax.FftType.RFFT, a, s=s, axes=axes,
                       norm=norm)
 
 
@@ -1131,7 +1150,7 @@ def irfft2(a: ArrayLike, s: Shape | None = None, axes: Sequence[int] = (-2,-1),
             [ 0.  ,  0.  ,  0.  ],
             [ 0.  ,  0.  ,  0.  ]]], dtype=float32)
   """
-  return _fft_core_2d('irfft2', xla_client.FftType.IRFFT, a, s=s, axes=axes,
+  return _fft_core_2d('irfft2', lax.FftType.IRFFT, a, s=s, axes=axes,
                       norm=norm)
 
 
@@ -1206,7 +1225,7 @@ def rfftfreq(n: int, d: ArrayLike = 1.0, *, dtype: DTypeLike | None = None,
     Array of sample frequencies, length ``n // 2 + 1``.
 
   See also:
-    - :func:`jax.numpy.fft.rfftfreq`: frequencies for use with
+    - :func:`jax.numpy.fft.fftfreq`: frequencies for use with
       :func:`~jax.numpy.fft.fft` and :func:`~jax.numpy.fft.ifft`.
   """
   dtype = dtype or dtypes.canonicalize_dtype(jnp.float_)
@@ -1233,8 +1252,41 @@ def rfftfreq(n: int, d: ArrayLike = 1.0, *, dtype: DTypeLike | None = None,
   return result
 
 
-@implements(np.fft.fftshift)
 def fftshift(x: ArrayLike, axes: None | int | Sequence[int] = None) -> Array:
+  """Shift zero-frequency fft component to the center of the spectrum.
+
+  JAX implementation of :func:`numpy.fft.fftshift`.
+
+  Args:
+    x: N-dimensional array array of frequencies.
+    axes: optional integer or sequence of integers specifying which axes to
+      shift. If None (default), then shift all axes.
+
+  Returns:
+    A shifted copy of ``x``.
+
+  See also:
+    - :func:`jax.numpy.fft.ifftshift`: inverse of ``fftshift``.
+    - :func:`jax.numpy.fft.fftfreq`: generate FFT frequencies.
+
+  Examples:
+    Generate FFT frequencies with :func:`~jax.numpy.fft.fftfreq`:
+
+    >>> freq = jnp.fft.fftfreq(5)
+    >>> freq
+    Array([ 0. ,  0.2,  0.4, -0.4, -0.2], dtype=float32)
+
+    Use ``fftshift`` to shift the zero-frequency entry to the middle of the array:
+
+    >>> shifted_freq = jnp.fft.fftshift(freq)
+    >>> shifted_freq
+    Array([-0.4, -0.2,  0. ,  0.2,  0.4], dtype=float32)
+
+    Unshift with :func:`~jax.numpy.fft.ifftshift` to recover the original frequencies:
+
+    >>> jnp.fft.ifftshift(shifted_freq)
+    Array([ 0. ,  0.2,  0.4, -0.4, -0.2], dtype=float32)
+  """
   check_arraylike("fftshift", x)
   x = jnp.asarray(x)
   shift: int | Sequence[int]
@@ -1249,8 +1301,42 @@ def fftshift(x: ArrayLike, axes: None | int | Sequence[int] = None) -> Array:
   return jnp.roll(x, shift, axes)
 
 
-@implements(np.fft.ifftshift)
 def ifftshift(x: ArrayLike, axes: None | int | Sequence[int] = None) -> Array:
+  """The inverse of :func:`jax.numpy.fft.fftshift`.
+
+  JAX implementation of :func:`numpy.fft.ifftshift`.
+
+  Args:
+    x: N-dimensional array array of frequencies.
+    axes: optional integer or sequence of integers specifying which axes to
+      shift. If None (default), then shift all axes.
+
+  Returns:
+    A shifted copy of ``x``.
+
+  See also:
+    - :func:`jax.numpy.fft.fftshift`: inverse of ``ifftshift``.
+    - :func:`jax.numpy.fft.fftfreq`: generate FFT frequencies.
+
+  Examples:
+    Generate FFT frequencies with :func:`~jax.numpy.fft.fftfreq`:
+
+    >>> freq = jnp.fft.fftfreq(5)
+    >>> freq
+    Array([ 0. ,  0.2,  0.4, -0.4, -0.2], dtype=float32)
+
+    Use :func:`~jax.numpy.fft.fftshift` to shift the zero-frequency entry
+    to the middle of the array:
+
+    >>> shifted_freq = jnp.fft.fftshift(freq)
+    >>> shifted_freq
+    Array([-0.4, -0.2,  0. ,  0.2,  0.4], dtype=float32)
+
+    Unshift with ``ifftshift`` to recover the original frequencies:
+
+    >>> jnp.fft.ifftshift(shifted_freq)
+    Array([ 0. ,  0.2,  0.4, -0.4, -0.2], dtype=float32)
+  """
   check_arraylike("ifftshift", x)
   x = jnp.asarray(x)
   shift: int | Sequence[int]

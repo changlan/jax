@@ -81,9 +81,8 @@ del _xc
 
 from jax._src.api import effects_barrier as effects_barrier
 from jax._src.api import block_until_ready as block_until_ready
-from jax._src.ad_checkpoint import checkpoint_wrapper as checkpoint
+from jax._src.ad_checkpoint import checkpoint_wrapper as checkpoint  # noqa: F401
 from jax._src.ad_checkpoint import checkpoint_policies as checkpoint_policies
-from jax._src.api import clear_backends as _deprecated_clear_backends
 from jax._src.api import clear_caches as clear_caches
 from jax._src.custom_derivatives import closure_convert as closure_convert
 from jax._src.custom_derivatives import custom_gradient as custom_gradient
@@ -122,7 +121,7 @@ from jax._src.xla_bridge import process_count as process_count
 from jax._src.xla_bridge import process_index as process_index
 from jax._src.xla_bridge import process_indices as process_indices
 from jax._src.callback import pure_callback as pure_callback
-from jax._src.ad_checkpoint import checkpoint_wrapper as remat
+from jax._src.ad_checkpoint import checkpoint_wrapper as remat  # noqa: F401
 from jax._src.api import ShapeDtypeStruct as ShapeDtypeStruct
 from jax._src.api import value_and_grad as value_and_grad
 from jax._src.api import vjp as vjp
@@ -161,6 +160,7 @@ from jax import debug as debug
 from jax import dlpack as dlpack
 from jax import dtypes as dtypes
 from jax import errors as errors
+from jax import ffi as ffi
 from jax import image as image
 from jax import lax as lax
 from jax import monitoring as monitoring
@@ -218,23 +218,15 @@ _deprecations = {
     "or jax.tree_util.tree_map (any JAX version).",
     _deprecated_tree_map
   ),
-  # Added Mar 18, 2024
+  # Finalized Nov 12 2024; remove after Feb 12 2025
   "clear_backends": (
-    "jax.clear_backends is deprecated.",
-    _deprecated_clear_backends
-  ),
-  # Remove after jax 0.4.35 release.
-  "xla_computation": (
-      "jax.xla_computation is deleted. Please use the AOT APIs; see "
-      "https://jax.readthedocs.io/en/latest/aot.html. For example, replace "
-      "xla_computation(f)(*xs) with jit(f).lower(*xs).compiler_ir('hlo'). See "
-      "CHANGELOG.md for 0.4.30 for more examples.", None
+    "jax.clear_backends was removed in JAX v0.4.36",
+    None
   ),
 }
 
 import typing as _typing
 if _typing.TYPE_CHECKING:
-  from jax._src.api import clear_backends as clear_backends
   from jax._src.tree_util import treedef_is_leaf as treedef_is_leaf
   from jax._src.tree_util import tree_flatten as tree_flatten
   from jax._src.tree_util import tree_leaves as tree_leaves
@@ -249,6 +241,6 @@ else:
   del _deprecation_getattr
 del _typing
 
-import jax.lib  # TODO(phawkins): remove this export.
+import jax.lib  # TODO(phawkins): remove this export.  # noqa: F401
 
 # trailer

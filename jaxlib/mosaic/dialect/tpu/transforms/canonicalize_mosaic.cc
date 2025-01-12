@@ -1,5 +1,10 @@
+#include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <numeric>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "llvm/ADT/STLExtras.h"
@@ -8,6 +13,8 @@
 // NOLINTNEXTLINE(misc-include-cleaner)
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 // NOLINTNEXTLINE(misc-include-cleaner)
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -15,13 +22,17 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
 #include "absl/log/check.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/include/mlir/Dialect/Math/IR/Math.h"
 #include "mlir/include/mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/include/mlir/Dialect/Vector/Transforms/VectorTransforms.h"
 #include "mlir/include/mlir/IR/AffineExpr.h"
 #include "mlir/include/mlir/IR/Attributes.h"
 #include "mlir/include/mlir/IR/Block.h"
 #include "mlir/include/mlir/IR/Builders.h"
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"
 #include "mlir/include/mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/include/mlir/IR/OpDefinition.h"
 #include "mlir/include/mlir/IR/Operation.h"
@@ -36,8 +47,21 @@ namespace mlir::tpu {
 #define GEN_PASS_DEF_CANONICALIZEMOSAICPASS
 #include "jaxlib/mosaic/dialect/tpu/tpu_passes.h.inc"
 
-LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
+namespace {
+
+struct CanonicalizeContext {
+  // see Note: Compatibility mode
+  bool compatibility_mode;
+
+  int hardware_generation;
+};
+
+LogicalResult tpu_matmul_rule(const CanonicalizeContext &ctx,
+                              tpu::MatmulOp op) {
   ImplicitLocOpBuilder builder(op.getLoc(), op.getOperation());
+
+  auto transpose_lhs = op.getTransposeLhs();
+  auto transpose_rhs = op.getTransposeRhs();
 
   auto lhs = op.getLhs();
   auto rhs = op.getRhs();
@@ -50,6 +74,51 @@ LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
   auto lhs_element_type = lhs_ty.getElementType();
   auto rhs_element_type = rhs_ty.getElementType();
   auto acc_element_type = acc_ty.getElementType();
+
+  // there are a few primary paths for dimension_numbers in matmul
+  // 1) No dimension numbers provided -> set to default
+  // 2) defined and not default -> verify and apply
+  // 3) defined and matching defaultDimensionNumbers -> no-op for
+  // canonicalization of dims
+  std::optional<int64_t> batch_size = std::nullopt;
+
+  // MKN matmul - no dims or transpositions set
+  if (!op.getDimensionNumbers().has_value()) {
+    // Legacy API - convert it to dimension numbers
+    op.setDimensionNumbersAttr(
+        defaultDimensionNumbers(builder, transpose_lhs, transpose_rhs));
+  } else if (
+      // Dot dim API - dimensions are provided and are not default
+      (op.getDimensionNumbers().value() !=
+       defaultDimensionNumbers(builder, false, false))) {
+    auto dimension_numbers = op.getDimensionNumbers();
+    auto lhs_contracting_dims = dimension_numbers->getLhsContractingDims();
+    auto rhs_contracting_dims = dimension_numbers->getRhsContractingDims();
+
+    auto lhs_batch_dims = dimension_numbers->getLhsBatchDims();
+    auto rhs_batch_dims = dimension_numbers->getRhsBatchDims();
+
+    // Invariant in matmul verifier: <= 1 batch dim atm, and that lhs and rhs
+    // are the same
+    // Invariant in matmul verifier: Exactly one contracting and non contracting
+    // dim in each of lhs and rhs for now.
+    batch_size =
+        lhs_batch_dims.empty()
+            ? std::nullopt
+            : std::optional<int64_t>(lhs_ty.getShape()[lhs_batch_dims[0]]);
+    // Lower each dim in contracting dims by size(batch_dims)
+    auto batch_adjusted_lhs_contracting_dim =
+        lhs_contracting_dims[0] - lhs_batch_dims.size();
+    auto batch_adjusted_rhs_contracting_dim =
+        rhs_contracting_dims[0] - rhs_batch_dims.size();
+
+    if (batch_adjusted_lhs_contracting_dim != 1) {
+      transpose_lhs = true;
+    }
+    if (batch_adjusted_rhs_contracting_dim != 0) {
+      transpose_rhs = true;
+    }
+  }
 
   auto extsi_sitofp = [&builder, &op](TypedValue<VectorType> element) {
     const VectorType ty = element.getType();
@@ -73,6 +142,11 @@ LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
   };
 
   if (lhs_element_type != rhs_element_type) {
+    if (!ctx.compatibility_mode) {
+      return op->emitOpError(
+          "Mosaic matmul invoked with mixed element types, but compatibility "
+          "mode is disabled.");
+    }
     if (lhs_element_type.isInteger() && rhs_element_type.isInteger()) {
       // TODO(mvoz): Add support for mixed int/int matmul.
       op->emitOpError("Mix int/int - NYI");
@@ -87,10 +161,12 @@ LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
     if (lhs_element_type.isInteger()) {
       auto float_lhs = extsi_sitofp(lhs);
       op->setOperand(0, float_lhs);
+      lhs = cast<TypedValue<VectorType>>(float_lhs.getResult());
     }
     if (rhs_element_type.isInteger()) {
       auto float_rhs = extsi_sitofp(rhs);
       op->setOperand(1, float_rhs);
+      rhs = cast<TypedValue<VectorType>>(float_rhs.getResult());
     }
   }
   // TODO(mvoz): Add more invariants.
@@ -113,10 +189,95 @@ LogicalResult tpu_matmul_rule(tpu::MatmulOp op) {
       return failure();
     }
   }
+
+  auto dot_dim_matmul = [&](auto lhs, auto rhs, auto acc) {
+    auto precision_attr = op.getPrecisionAttr();
+
+    // If we are transposing the lhs, we need to transpose the lhs before
+    // matmul here, as we don't have lhs fusion implemented in apply.
+    if (transpose_lhs) {
+      auto lhs_ty = cast<VectorType>(lhs.getType());
+      auto rank = lhs_ty.getShape().size();
+
+      // This transposition must run on vectors with rank >= 2
+      CHECK_GE(rank, 2);
+
+      std::vector<int64_t> perm(rank);
+      std::iota(perm.begin(), perm.end(), 0);
+      std::swap(perm[rank - 2], perm[rank - 1]);
+
+      std::vector<int64_t> shape(lhs_ty.getShape());
+      std::swap(shape[rank - 2], shape[rank - 1]);
+
+      auto lhs_ty_transposed = VectorType::get(shape, lhs_ty.getElementType());
+
+      const SmallVector<int64_t> perm_vec =
+          SmallVector<int64_t>(perm.begin(), perm.end());
+      lhs = builder.create<vector::TransposeOp>(
+          lhs_ty_transposed, lhs,
+          DenseI64ArrayAttr::get(builder.getContext(), perm_vec));
+    }
+    auto ddn = defaultDimensionNumbers(builder, /*transpose_lhs=*/false,
+                                       transpose_rhs);
+    // transpose flags are always false here, because ddn takes precedence
+    // after this pass.
+    auto matmul_res = builder.create<tpu::MatmulOp>(
+        op.getLoc(), acc.getType(), lhs, rhs, acc,
+        /*transpose_lhs=*/false,
+        /*transpose_rhs=*/false, precision_attr, ddn);
+    return matmul_res;
+  };
+
+  // If we have a batch_size, we want to slice rhs and lhs [:batch_size],
+  // and then do O[i] = A[i] @ B[i]
+  // Produce an output shape of [batch_size, m, n]
+  if (batch_size.has_value()) {
+    std::vector<Value> outputs;
+
+    for (int64_t i = 0; i < batch_size; ++i) {
+      auto sliced_lhs = builder.create<vector::ExtractOp>(op.getLoc(), lhs,
+                                                          ArrayRef<int64_t>{i});
+      auto sliced_rhs = builder.create<vector::ExtractOp>(op.getLoc(), rhs,
+                                                          ArrayRef<int64_t>{i});
+
+      auto sliced_acc = builder.create<vector::ExtractOp>(op.getLoc(), acc,
+                                                          ArrayRef<int64_t>{i});
+
+      auto matmul_res =
+          dot_dim_matmul(sliced_lhs.getResult(), sliced_rhs.getResult(),
+                         sliced_acc.getResult());
+      auto res_ty = matmul_res.getType().cast<VectorType>();
+      auto res_shape = res_ty.getShape();
+      // reshape to 1x[prior_shape]
+      auto reshape_shape = llvm::to_vector(res_shape);
+      reshape_shape.insert(reshape_shape.begin(), 1);
+      auto shape_cast = builder.create<vector::ShapeCastOp>(
+          op.getLoc(), VectorType::get(reshape_shape, res_ty.getElementType()),
+          matmul_res);
+      outputs.push_back(shape_cast);
+    }
+    // Technically almost identical to the case where batch_size is 1, but
+    // we want to avoid the spurious concat here.
+    if (batch_size == 1) {
+      op.replaceAllUsesWith(outputs[0]);
+      op.erase();
+      return success();
+    }
+    auto output = builder
+                      .create<tpu::ConcatenateOp>(op.getLoc(), acc_ty, outputs,
+                                                  /*dimension=*/0)
+                      .getResult();
+    op.replaceAllUsesWith(output);
+    op.erase();
+  } else {
+    auto matmul_res = dot_dim_matmul(lhs, rhs, acc).getResult();
+    op.replaceAllUsesWith(matmul_res);
+    op.erase();
+  }
   return success();
 };
 
-LogicalResult canonicalize_elementwise(int hardware_generation_,
+LogicalResult canonicalize_elementwise(const CanonicalizeContext &ctx,
                                        Operation &op) {
   OpBuilder builder(&op);
   auto operands = op.getOperands();
@@ -147,16 +308,28 @@ LogicalResult canonicalize_elementwise(int hardware_generation_,
         return failure();
       }
       auto element_type = ty.getElementType();
-      // PowFOp and DivFOp do not seem to be supported in bf16 on later
-      // hardware.
-      bool needs_cast = hardware_generation_ <= 5 || isa<math::PowFOp>(op) ||
-                        isa<arith::DivFOp>(op);
+      // There's an annoying hodgepodge of elementwise ops that need to be
+      // rewritten to f32 on later hardware.
+      // TODO(mvoz): Look into (1) what it would take to support these ops
+      // natively on later hardware, and (2) how to better organize this list.
+      bool needs_cast = ctx.hardware_generation <= 5 || isa<math::PowFOp>(op) ||
+                        isa<math::TanhOp>(op) || isa<math::ExpOp>(op) ||
+                        isa<math::LogOp>(op);
       if (needs_cast && element_type.isBF16()) {
-        auto target_f32 =
-            builder.create<arith::ExtFOp>(op.getLoc(), target_f32_ty, operand)
-                .getResult();
-        should_rewrite_op = true;
-        new_operands.push_back(target_f32);
+        if (ctx.compatibility_mode) {
+          auto target_f32 =
+              builder.create<arith::ExtFOp>(op.getLoc(), target_f32_ty, operand)
+                  .getResult();
+          should_rewrite_op = true;
+          new_operands.push_back(target_f32);
+        } else {
+          op.emitOpError(
+              "Compatibility mode disabled. Unsupported element type in "
+              "elementwise op on hardware generation: ")
+              << ctx.hardware_generation
+              << ". Use hardware generation after 5 or cast to f32.";
+          return failure();
+        }
       } else {
         new_operands.push_back(operand);
       }
@@ -188,7 +361,7 @@ LogicalResult canonicalize_elementwise(int hardware_generation_,
   return success();
 }
 
-LogicalResult canonicalize_multi_dim_reduction(int hardware_generation,
+LogicalResult canonicalize_multi_dim_reduction(const CanonicalizeContext &ctx,
                                                Operation &operation) {
   ImplicitLocOpBuilder builder(operation.getLoc(), &operation);
   auto op = cast<vector::MultiDimReductionOp>(operation);
@@ -208,7 +381,7 @@ LogicalResult canonicalize_multi_dim_reduction(int hardware_generation,
         reduces_sublanes = true;
       }
     }
-    if (hardware_generation <= 5 || reduces_sublanes) {
+    if (ctx.hardware_generation <= 5) {
       auto new_source = builder.create<arith::ExtFOp>(
           VectorType::get(source_ty.getShape(), builder.getF32Type()),
           op.getSource());
@@ -237,20 +410,29 @@ LogicalResult canonicalize_multi_dim_reduction(int hardware_generation,
       op.erase();
     }
     return success();
+  } else if (element_type.isSignlessInteger(32) &&
+             // TODO(b/384774084): Add support for u32 reductions.
+             (op.getKind() == vector::CombiningKind::ADD ||
+              op.getKind() == vector::CombiningKind::MAXSI ||
+              op.getKind() == vector::CombiningKind::MINSI)) {
+    return success();
   }
+  op.emitOpError("Unsupported element type for the selected reduction");
   return failure();
 }
 
-LogicalResult canonicalize_matmul(int hardware_generation, Operation &op) {
+LogicalResult canonicalize_matmul(const CanonicalizeContext &ctx,
+                                  Operation &op) {
   auto matmul_op = dyn_cast<tpu::MatmulOp>(op);
   if (!matmul_op) {
     op.emitOpError("Invariant violated: Not a matmul");
     return failure();
   }
-  return tpu_matmul_rule(matmul_op);
+  return tpu_matmul_rule(ctx, matmul_op);
 };
 
-LogicalResult canonicalize_contraction(int hardware_generation, Operation &op) {
+LogicalResult canonicalize_contraction(const CanonicalizeContext &ctx,
+                                       Operation &op) {
   auto contraction_op = dyn_cast<vector::ContractionOp>(op);
   if (!contraction_op) {
     op.emitOpError("Invariant violated: Not a contraction");
@@ -308,16 +490,22 @@ LogicalResult canonicalize_contraction(int hardware_generation, Operation &op) {
   }
   const tpu::ContractPrecisionAttr precision_attr =  // May be null
       contraction_op->getAttrOfType<tpu::ContractPrecisionAttr>("precision");
+
+  const auto dot_dimension_numbers_attr =
+      defaultDimensionNumbers(builder, false, transpose_rhs);
+
   auto matmul_op = builder.create<tpu::MatmulOp>(
       contraction_op->getLoc(), acc_ty, lhs, rhs, acc,
-      /*transpose_lhs=*/false, transpose_rhs, precision_attr);
+      /*transpose_lhs=*/false,
+      /*transpose_rhs=*/false, precision_attr, dot_dimension_numbers_attr);
   contraction_op.replaceAllUsesWith(matmul_op.getResult());
   contraction_op.erase();
-  auto result = tpu_matmul_rule(matmul_op);
+  auto result = tpu_matmul_rule(ctx, matmul_op);
   return result;
 }
 
-LogicalResult canonicalize_extract(int hardware_generation, Operation &raw_op) {
+LogicalResult canonicalize_extract(const CanonicalizeContext &ctx,
+                                   Operation &raw_op) {
   auto op = dyn_cast<vector::ExtractOp>(raw_op);
   Type result_ty = op.getResult().getType();
   if (!isa<VectorType>(result_ty)) {
@@ -332,7 +520,8 @@ LogicalResult canonicalize_extract(int hardware_generation, Operation &raw_op) {
   return success();
 }
 
-LogicalResult canonicalize_select(int hardware_generation, Operation &raw_op) {
+LogicalResult canonicalize_select(const CanonicalizeContext &ctx,
+                                  Operation &raw_op) {
   auto op = dyn_cast<arith::SelectOp>(raw_op);
   if (!isa<VectorType>(op.getType()) ||
       isa<VectorType>(op.getCondition().getType())) {
@@ -350,17 +539,42 @@ LogicalResult canonicalize_select(int hardware_generation, Operation &raw_op) {
   return success();
 }
 
+LogicalResult canonicalize_repeat(const CanonicalizeContext &ctx,
+                                  Operation &raw_op) {
+  auto op = dyn_cast<tpu::RepeatOp>(raw_op);
+  if (!isa<VectorType>(op.getType())) {
+    return op.emitOpError("Only vector types supported");
+  }
+  auto operand = op.getSource();
+  auto times = op.getTimes();
+  if (times == 1) {
+    // A true no op - kind of an odd edge case, but this does come up in
+    // flash_attention_backward tests.
+    op.replaceAllUsesWith(operand);
+    op.erase();
+    return success();
+  }
+  auto operands = std::vector<Value>(times, operand);
+  ImplicitLocOpBuilder builder(op->getLoc(), op.getOperation());
+  auto concat = builder.create<tpu::ConcatenateOp>(op.getLoc(), op.getType(),
+                                                   operands, op.getDimension());
+  op.replaceAllUsesWith(concat.getResult());
+  op.erase();
+  return success();
+}
+
 using canonicalize_rule_type =
-    std::function<LogicalResult(int hardware_generation, Operation &op)>;
+    std::function<LogicalResult(const CanonicalizeContext &ctx, Operation &op)>;
 
 const llvm::StringMap<canonicalize_rule_type> &rules() {
   static auto rules = new llvm::StringMap<canonicalize_rule_type>{
       {tpu::MatmulOp::getOperationName(), canonicalize_matmul},
       {vector::ContractionOp::getOperationName(), canonicalize_contraction},
-      {vector::ContractionOp::getOperationName(), canonicalize_extract},
+      {vector::ExtractOp::getOperationName(), canonicalize_extract},
       {vector::MultiDimReductionOp::getOperationName(),
        canonicalize_multi_dim_reduction},
-      {arith::SelectOp::getOperationName(), canonicalize_select}};
+      {arith::SelectOp::getOperationName(), canonicalize_select},
+      {tpu::RepeatOp::getOperationName(), canonicalize_repeat}};
   return *rules;
 }
 
@@ -371,16 +585,21 @@ const llvm::StringSet<> &elementwise_convertible_ops() {
                                           arith::SubFOp::getOperationName(),
                                           arith::MaximumFOp::getOperationName(),
                                           arith::MinimumFOp::getOperationName(),
-                                          math::PowFOp::getOperationName()};
+                                          math::PowFOp::getOperationName(),
+                                          math::TanhOp::getOperationName(),
+                                          math::ExpOp::getOperationName(),
+                                          math::LogOp::getOperationName()};
   return *ops;
 }
 
 class MosaicCanonicalizer {
  public:
-  MosaicCanonicalizer(int hardware_generation)
-      : hardware_generation_(hardware_generation) {}
+  MosaicCanonicalizer(int hardware_generation, bool compatibility_mode)
+      : hardware_generation_(hardware_generation),
+        compatibility_mode_(compatibility_mode) {}
 
   int hardware_generation_;
+  bool compatibility_mode_;
 
   LogicalResult canonicalize(func::FuncOp op) {
     if (!op.getBody().hasOneBlock()) {
@@ -401,6 +620,7 @@ class MosaicCanonicalizer {
   }
 
   LogicalResult canonicalizeOp(Operation &any_op) {
+    CanonicalizeContext ctx({compatibility_mode_, hardware_generation_});
     // We must iterate over the op first, because canonicalization can cause
     // us to .erase() an op, and accessing getRegions on it after is not sound.
     // Invariant - top level ops with regions may never be invalidated.
@@ -413,12 +633,12 @@ class MosaicCanonicalizer {
     }
     if (elementwise_convertible_ops().contains(
             any_op.getName().getStringRef())) {
-      return canonicalize_elementwise(hardware_generation_, any_op);
+      return canonicalize_elementwise(ctx, any_op);
     }
     if (auto rule_it = rules().find(any_op.getName().getStringRef());
         rule_it != rules().end()) {
       const canonicalize_rule_type &rule = rule_it->getValue();
-      return rule(hardware_generation_, any_op);
+      return rule(ctx, any_op);
     }
     return success();
   }
@@ -426,22 +646,28 @@ class MosaicCanonicalizer {
 
 struct CanonicalizeMosaicPass
     : public impl::CanonicalizeMosaicPassBase<CanonicalizeMosaicPass> {
-  CanonicalizeMosaicPass(int hardware_generation) {
-    this->hardware_generation = hardware_generation;
+  CanonicalizeMosaicPass(int hardware_generation_p, bool compatibility_mode_p)
+      : compatibility_mode_(compatibility_mode_p) {
+    this->hardware_generation = hardware_generation_p;
   }
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
-    MosaicCanonicalizer vlc(hardware_generation);
+    MosaicCanonicalizer vlc(hardware_generation, compatibility_mode_);
     if (vlc.canonicalize(func).failed()) {
       signalPassFailure();
     }
   };
+
+  bool compatibility_mode_;
 };
 
+}  // namespace
+
 std::unique_ptr<OperationPass<func::FuncOp>> createCanonicalizeMosaicPass(
-    int hardware_generation) {
-  return std::make_unique<CanonicalizeMosaicPass>(hardware_generation);
+    int hardware_generation, bool compatibility_mode) {
+  return std::make_unique<CanonicalizeMosaicPass>(hardware_generation,
+                                                  compatibility_mode);
 }
 
 }  // namespace mlir::tpu

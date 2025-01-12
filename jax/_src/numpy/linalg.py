@@ -18,7 +18,6 @@ from collections.abc import Sequence
 from functools import partial
 import itertools
 import math
-import warnings
 
 import numpy as np
 import operator
@@ -35,8 +34,11 @@ from jax._src.lax import linalg as lax_linalg
 from jax._src.numpy import lax_numpy as jnp
 from jax._src.numpy import reductions, ufuncs
 from jax._src.numpy.util import promote_dtypes_inexact, check_arraylike
-from jax._src.util import canonicalize_axis
+from jax._src.util import canonicalize_axis, set_module
 from jax._src.typing import ArrayLike, Array, DTypeLike, DeprecatedArg
+
+
+export = set_module('jax.numpy.linalg')
 
 
 class EighResult(NamedTuple):
@@ -67,6 +69,7 @@ def _H(x: ArrayLike) -> Array:
 def _symmetrize(x: Array) -> Array: return (x + _H(x)) / 2
 
 
+@export
 @partial(jit, static_argnames=['upper'])
 def cholesky(a: ArrayLike, *, upper: bool = False) -> Array:
   """Compute the Cholesky decomposition of a matrix.
@@ -91,8 +94,8 @@ def cholesky(a: ArrayLike, *, upper: bool = False) -> Array:
   Args:
     a: input array, representing a (batched) positive-definite hermitian matrix.
       Must have shape ``(..., N, N)``.
-    upper: if True, compute the upper Cholesky decomposition `L`. if False
-      (default), compute the lower Cholesky decomposition `U`.
+    upper: if True, compute the upper Cholesky decomposition `U`. if False
+      (default), compute the lower Cholesky decomposition `L`.
 
   Returns:
     array of shape ``(..., N, N)`` representing the Cholesky decomposition
@@ -191,6 +194,7 @@ def svd(
   ...
 
 
+@export
 @partial(
     jit,
     static_argnames=(
@@ -311,6 +315,7 @@ def svd(
     )
 
 
+@export
 @partial(jit, static_argnames=('n',))
 def matrix_power(a: ArrayLike, n: int) -> Array:
   """Raise a square matrix to an integer power.
@@ -392,6 +397,7 @@ def matrix_power(a: ArrayLike, n: int) -> Array:
   return result
 
 
+@export
 @jit
 def matrix_rank(
   M: ArrayLike, rtol: ArrayLike | None = None, *,
@@ -496,6 +502,7 @@ def _slogdet_qr(a: Array) -> tuple[Array, Array]:
   return sign_diag * sign_taus, log_abs_det
 
 
+@export
 @partial(jit, static_argnames=('method',))
 def slogdet(a: ArrayLike, *, method: str | None = None) -> SlogdetResult:
   """
@@ -532,7 +539,7 @@ def slogdet(a: ArrayLike, *, method: str | None = None) -> SlogdetResult:
   a, = promote_dtypes_inexact(jnp.asarray(a))
   a_shape = jnp.shape(a)
   if len(a_shape) < 2 or a_shape[-1] != a_shape[-2]:
-    raise ValueError("Argument to slogdet() must have shape [..., n, n], got {a_shape}")
+    raise ValueError(f"Argument to slogdet() must have shape [..., n, n], got {a_shape}")
   if method is None or method == "lu":
     return SlogdetResult(*_slogdet_lu(a))
   elif method == "qr":
@@ -675,6 +682,7 @@ def _det_jvp(primals, tangents):
   return y, jnp.trace(z, axis1=-1, axis2=-2)
 
 
+@export
 @jit
 def det(a: ArrayLike) -> Array:
   """
@@ -711,6 +719,7 @@ def det(a: ArrayLike) -> Array:
     raise ValueError(msg.format(a_shape))
 
 
+@export
 def eig(a: ArrayLike) -> tuple[Array, Array]:
   """
   Compute the eigenvalues and eigenvectors of a square array.
@@ -731,7 +740,9 @@ def eig(a: ArrayLike) -> tuple[Array, Array]:
     - This differs from :func:`numpy.linalg.eig` in that the return type of
       :func:`jax.numpy.linalg.eig` is always complex64 for 32-bit input, and complex128
       for 64-bit input.
-    - At present, non-symmetric eigendecomposition is only implemented on the CPU backend.
+    - At present, non-symmetric eigendecomposition is only implemented on the CPU and
+      GPU backends. For more details about the GPU implementation, see the
+      documentation for :func:`jax.lax.linalg.eig`.
 
   See also:
     - :func:`jax.numpy.linalg.eigh`: eigenvectors and eigenvalues of a Hermitian matrix.
@@ -754,6 +765,7 @@ def eig(a: ArrayLike) -> tuple[Array, Array]:
   return w, v
 
 
+@export
 @jit
 def eigvals(a: ArrayLike) -> Array:
   """
@@ -791,6 +803,7 @@ def eigvals(a: ArrayLike) -> Array:
                         compute_right_eigenvectors=False)[0]
 
 
+@export
 @partial(jit, static_argnames=('UPLO', 'symmetrize_input'))
 def eigh(a: ArrayLike, UPLO: str | None = None,
          symmetrize_input: bool = True) -> EighResult:
@@ -846,6 +859,7 @@ def eigh(a: ArrayLike, UPLO: str | None = None,
   return EighResult(w, v)
 
 
+@export
 @partial(jit, static_argnames=('UPLO',))
 def eigvalsh(a: ArrayLike, UPLO: str | None = 'L') -> Array:
   """
@@ -882,6 +896,7 @@ def eigvalsh(a: ArrayLike, UPLO: str | None = 'L') -> Array:
 
 
 # TODO(micky774): deprecated 2024-5-14, remove wrapper after deprecation expires.
+@export
 def pinv(a: ArrayLike, rtol: ArrayLike | None = None,
          hermitian: bool = False, *,
          rcond: ArrayLike | DeprecatedArg | None = DeprecatedArg()) -> Array:
@@ -908,7 +923,7 @@ def pinv(a: ArrayLike, rtol: ArrayLike | None = None,
     - :func:`jax.numpy.linalg.inv`: multiplicative inverse of a square matrix.
 
   Notes:
-    :func:`jax.numpy.linalg.prng` differs from :func:`numpy.linalg.prng` in the
+    :func:`jax.numpy.linalg.pinv` differs from :func:`numpy.linalg.pinv` in the
     default value of `rcond``: in NumPy, the default  is `1e-15`. In JAX, the
     default is ``10. * max(num_rows, num_cols) * jnp.finfo(dtype).eps``.
 
@@ -995,6 +1010,7 @@ def _pinv_jvp(rtol, hermitian, primals, tangents):
   return p, p_dot
 
 
+@export
 @jit
 def inv(a: ArrayLike) -> Array:
   """Return the inverse of a square matrix
@@ -1055,6 +1071,7 @@ def inv(a: ArrayLike) -> Array:
     arr, lax.broadcast(jnp.eye(arr.shape[-1], dtype=arr.dtype), arr.shape[:-2]))
 
 
+@export
 @partial(jit, static_argnames=('ord', 'axis', 'keepdims'))
 def norm(x: ArrayLike, ord: int | str | None = None,
          axis: None | tuple[int, ...] | int = None,
@@ -1141,35 +1158,7 @@ def norm(x: ArrayLike, ord: int | str | None = None,
 
   num_axes = len(axis)
   if num_axes == 1:
-    if ord is None or ord == 2:
-      return ufuncs.sqrt(reductions.sum(ufuncs.real(x * ufuncs.conj(x)), axis=axis,
-                                        keepdims=keepdims))
-    elif ord == jnp.inf:
-      return reductions.amax(ufuncs.abs(x), axis=axis, keepdims=keepdims)
-    elif ord == -jnp.inf:
-      return reductions.amin(ufuncs.abs(x), axis=axis, keepdims=keepdims)
-    elif ord == 0:
-      return reductions.sum(x != 0, dtype=jnp.finfo(lax.dtype(x)).dtype,
-                            axis=axis, keepdims=keepdims)
-    elif ord == 1:
-      # Numpy has a special case for ord == 1 as an optimization. We don't
-      # really need the optimization (XLA could do it for us), but the Numpy
-      # code has slightly different type promotion semantics, so we need a
-      # special case too.
-      return reductions.sum(ufuncs.abs(x), axis=axis, keepdims=keepdims)
-    elif isinstance(ord, str):
-      msg = f"Invalid order '{ord}' for vector norm."
-      if ord == "inf":
-        msg += "Use 'jax.numpy.inf' instead."
-      if ord == "-inf":
-        msg += "Use '-jax.numpy.inf' instead."
-      raise ValueError(msg)
-    else:
-      abs_x = ufuncs.abs(x)
-      ord_arr = lax_internal._const(abs_x, ord)
-      ord_inv = lax_internal._const(abs_x, 1. / ord_arr)
-      out = reductions.sum(abs_x ** ord_arr, axis=axis, keepdims=keepdims)
-      return ufuncs.power(out, ord_inv)
+    return vector_norm(x, ord=2 if ord is None else ord, axis=axis, keepdims=keepdims)
 
   elif num_axes == 2:
     row_axis, col_axis = axis  # pytype: disable=bad-unpacking
@@ -1220,6 +1209,7 @@ def qr(a: ArrayLike, mode: Literal["r"]) -> Array: ...
 @overload
 def qr(a: ArrayLike, mode: str = "reduced") -> Array | QRResult: ...
 
+@export
 @partial(jit, static_argnames=('mode',))
 def qr(a: ArrayLike, mode: str = "reduced") -> Array | QRResult:
   """Compute the QR decomposition of an array
@@ -1297,12 +1287,13 @@ def qr(a: ArrayLike, mode: str = "reduced") -> Array | QRResult:
     full_matrices = True
   else:
     raise ValueError(f"Unsupported QR decomposition mode '{mode}'")
-  q, r = lax_linalg.qr(a, full_matrices=full_matrices)
+  q, r = lax_linalg.qr(a, pivoting=False, full_matrices=full_matrices)
   if mode == "r":
     return r
   return QRResult(q, r)
 
 
+@export
 @jit
 def solve(a: ArrayLike, b: ArrayLike) -> Array:
   """Solve a linear system of equations
@@ -1344,17 +1335,19 @@ def solve(a: ArrayLike, b: ArrayLike) -> Array:
   check_arraylike("jnp.linalg.solve", a, b)
   a, b = promote_dtypes_inexact(jnp.asarray(a), jnp.asarray(b))
 
-  if b.ndim == 1:
-    signature = "(m,m),(m)->(m)"
-  elif a.ndim == b.ndim + 1:
-    # Deprecation warning added 2024-02-06
-    warnings.warn("jnp.linalg.solve: batched 1D solves with b.ndim > 1 are deprecated, "
-                  "and in the future will be treated as a batched 2D solve. "
-                  "Use solve(a, b[..., None])[..., 0] to avoid this warning.",
-                  category=FutureWarning)
-    signature = "(m,m),(m)->(m)"
-  else:
-    signature = "(m,m),(m,n)->(m,n)"
+  if a.ndim < 2:
+    raise ValueError(
+      f"left hand array must be at least two dimensional; got {a.shape=}")
+
+  # Check for invalid inputs that previously would have led to a batched 1D solve:
+  if (b.ndim > 1 and a.ndim == b.ndim + 1 and
+      a.shape[-1] == b.shape[-1] and a.shape[-1] != b.shape[-2]):
+    raise ValueError(
+      f"Invalid shapes for solve: {a.shape}, {b.shape}. Prior to JAX v0.5.0,"
+      " this would have been treated as a batched 1-dimensional solve."
+      " To recover this behavior, use solve(a, b[..., None]).squeeze(-1).")
+
+  signature = "(m,m),(m)->(m)" if b.ndim == 1 else "(m,m),(m,n)->(m,n)"
   return jnp.vectorize(lax_linalg._solve, signature=signature)(a, b)
 
 
@@ -1382,7 +1375,7 @@ def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
     x = jnp.empty((n, *b.shape[1:]), dtype=a.dtype)
   else:
     if rcond is None:
-      rcond = jnp.finfo(dtype).eps * max(n, m)
+      rcond = float(jnp.finfo(dtype).eps) * max(n, m)
     else:
       rcond = jnp.where(rcond < 0, jnp.finfo(dtype).eps, rcond)
     u, s, vt = svd(a, full_matrices=False)
@@ -1406,6 +1399,7 @@ def _lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None, *,
 _jit_lstsq = jit(partial(_lstsq, numpy_resid=False))
 
 
+@export
 def lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None = None, *,
           numpy_resid: bool = False) -> tuple[Array, Array, Array, Array]:
   """
@@ -1446,6 +1440,7 @@ def lstsq(a: ArrayLike, b: ArrayLike, rcond: float | None = None, *,
   return _jit_lstsq(a, b, rcond)
 
 
+@export
 def cross(x1: ArrayLike, x2: ArrayLike, /, *, axis=-1):
   r"""Compute the cross-product of two 3D vectors
 
@@ -1491,6 +1486,7 @@ def cross(x1: ArrayLike, x2: ArrayLike, /, *, axis=-1):
   return jnp.cross(x1, x2, axis=axis)
 
 
+@export
 def outer(x1: ArrayLike, x2: ArrayLike, /) -> Array:
   """Compute the outer product of two 1-dimensional arrays.
 
@@ -1521,7 +1517,8 @@ def outer(x1: ArrayLike, x2: ArrayLike, /) -> Array:
   return x1[:, None] * x2[None, :]
 
 
-def matrix_norm(x: ArrayLike, /, *, keepdims: bool = False, ord: str = 'fro') -> Array:
+@export
+def matrix_norm(x: ArrayLike, /, *, keepdims: bool = False, ord: str | int = 'fro') -> Array:
   """Compute the norm of a matrix or stack of matrices.
 
   JAX implementation of :func:`numpy.linalg.matrix_norm`
@@ -1551,6 +1548,7 @@ def matrix_norm(x: ArrayLike, /, *, keepdims: bool = False, ord: str = 'fro') ->
   return norm(x, ord=ord, keepdims=keepdims, axis=(-2, -1))
 
 
+@export
 def matrix_transpose(x: ArrayLike, /) -> Array:
   """Transpose a matrix or stack of matrices.
 
@@ -1606,7 +1604,8 @@ def matrix_transpose(x: ArrayLike, /) -> Array:
   return jax.lax.transpose(x_arr, (*range(ndim - 2), ndim - 1, ndim - 2))
 
 
-def vector_norm(x: ArrayLike, /, *, axis: int | None = None, keepdims: bool = False,
+@export
+def vector_norm(x: ArrayLike, /, *, axis: int | tuple[int, ...] | None = None, keepdims: bool = False,
                 ord: int | str = 2) -> Array:
   """Compute the vector norm of a vector or batch of vectors.
 
@@ -1642,14 +1641,37 @@ def vector_norm(x: ArrayLike, /, *, axis: int | None = None, keepdims: bool = Fa
     Array([3.7416575, 9.486833 ], dtype=float32)
   """
   check_arraylike('jnp.linalg.vector_norm', x)
-  if axis is None:
-    result = norm(jnp.ravel(x), ord=ord)
-    if keepdims:
-      result = lax.expand_dims(result, range(jnp.ndim(x)))
-    return result
-  return norm(x, axis=axis, keepdims=keepdims, ord=ord)
+  if ord is None or ord == 2:
+    return ufuncs.sqrt(reductions.sum(ufuncs.real(x * ufuncs.conj(x)), axis=axis,
+                                      keepdims=keepdims))
+  elif ord == jnp.inf:
+    return reductions.amax(ufuncs.abs(x), axis=axis, keepdims=keepdims)
+  elif ord == -jnp.inf:
+    return reductions.amin(ufuncs.abs(x), axis=axis, keepdims=keepdims)
+  elif ord == 0:
+    return reductions.sum(x != 0, dtype=jnp.finfo(lax.dtype(x)).dtype,
+                          axis=axis, keepdims=keepdims)
+  elif ord == 1:
+    # Numpy has a special case for ord == 1 as an optimization. We don't
+    # really need the optimization (XLA could do it for us), but the Numpy
+    # code has slightly different type promotion semantics, so we need a
+    # special case too.
+    return reductions.sum(ufuncs.abs(x), axis=axis, keepdims=keepdims)
+  elif isinstance(ord, str):
+    msg = f"Invalid order '{ord}' for vector norm."
+    if ord == "inf":
+      msg += "Use 'jax.numpy.inf' instead."
+    if ord == "-inf":
+      msg += "Use '-jax.numpy.inf' instead."
+    raise ValueError(msg)
+  else:
+    abs_x = ufuncs.abs(x)
+    ord_arr = lax_internal._const(abs_x, ord)
+    ord_inv = lax_internal._const(abs_x, 1. / ord_arr)
+    out = reductions.sum(abs_x ** ord_arr, axis=axis, keepdims=keepdims)
+    return ufuncs.power(out, ord_inv)
 
-
+@export
 def vecdot(x1: ArrayLike, x2: ArrayLike, /, *, axis: int = -1,
            precision: PrecisionLike = None,
            preferred_element_type: DTypeLike | None = None) -> Array:
@@ -1700,6 +1722,7 @@ def vecdot(x1: ArrayLike, x2: ArrayLike, /, *, axis: int = -1,
                     preferred_element_type=preferred_element_type)
 
 
+@export
 def matmul(x1: ArrayLike, x2: ArrayLike, /, *,
            precision: PrecisionLike = None,
            preferred_element_type: DTypeLike | None = None) -> Array:
@@ -1760,6 +1783,7 @@ def matmul(x1: ArrayLike, x2: ArrayLike, /, *,
                     preferred_element_type=preferred_element_type)
 
 
+@export
 def tensordot(x1: ArrayLike, x2: ArrayLike, /, *,
               axes: int | tuple[Sequence[int], Sequence[int]] = 2,
               precision: PrecisionLike = None,
@@ -1841,6 +1865,7 @@ def tensordot(x1: ArrayLike, x2: ArrayLike, /, *,
                        preferred_element_type=preferred_element_type)
 
 
+@export
 def svdvals(x: ArrayLike, /) -> Array:
   """Compute the singular values of a matrix.
 
@@ -1865,6 +1890,7 @@ def svdvals(x: ArrayLike, /) -> Array:
   return svd(x, compute_uv=False, hermitian=False)
 
 
+@export
 def diagonal(x: ArrayLike, /, *, offset: int = 0) -> Array:
   """Extract the diagonal of an matrix or stack of matrices.
 
@@ -1905,6 +1931,7 @@ def diagonal(x: ArrayLike, /, *, offset: int = 0) -> Array:
   return jnp.diagonal(x, offset=offset, axis1=-2, axis2=-1)
 
 
+@export
 def tensorinv(a: ArrayLike, ind: int = 2) -> Array:
   """Compute the tensor inverse of an array.
 
@@ -1947,6 +1974,7 @@ def tensorinv(a: ArrayLike, ind: int = 2) -> Array:
   return inv(arr.reshape(flatshape)).reshape(*batch_shape, *contracting_shape)
 
 
+@export
 def tensorsolve(a: ArrayLike, b: ArrayLike, axes: tuple[int, ...] | None = None) -> Array:
   """Solve the tensor equation a x = b for x.
 
@@ -1996,6 +2024,7 @@ def tensorsolve(a: ArrayLike, b: ArrayLike, axes: tuple[int, ...] | None = None)
   return solve(a_arr, b_arr.ravel()).reshape(out_shape)
 
 
+@export
 def multi_dot(arrays: Sequence[ArrayLike], *, precision: PrecisionLike = None) -> Array:
   """Efficiently compute matrix products between a sequence of arrays.
 
@@ -2085,9 +2114,10 @@ def multi_dot(arrays: Sequence[ArrayLike], *, precision: PrecisionLike = None) -
   if arrs[-1].ndim == 1:
     einsum_axes[-1] = einsum_axes[-1][:1]
   return jnp.einsum(*itertools.chain(*zip(arrs, einsum_axes)),  # type: ignore[call-overload]
-                    optimize='optimal', precision=precision)
+                    optimize='auto', precision=precision)
 
 
+@export
 @partial(jit, static_argnames=['p'])
 def cond(x: ArrayLike, p=None):
   """Compute the condition number of a matrix.
@@ -2147,6 +2177,7 @@ def cond(x: ArrayLike, p=None):
   return jnp.where(ufuncs.isnan(r) & ~ufuncs.isnan(x).any(axis=(-2, -1)), jnp.inf, r)
 
 
+@export
 def trace(x: ArrayLike, /, *,
           offset: int = 0, dtype: DTypeLike | None = None) -> Array:
   """Compute the trace of a matrix.

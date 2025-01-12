@@ -20,8 +20,7 @@ from jax._src.lax.lax import (
   Precision as Precision,
   PrecisionLike as PrecisionLike,
   DotAlgorithm as DotAlgorithm,
-  DotAlgorithmLike as DotAlgorithmLike,
-  DotTransposeAlgorithmLike as DotTransposeAlgorithmLike,
+  DotAlgorithmPreset as DotAlgorithmPreset,
   RandomAlgorithm as RandomAlgorithm,
   RoundingMethod as RoundingMethod,
   abs as abs,
@@ -73,6 +72,7 @@ from jax._src.lax.lax import (
   collapse as collapse,
   complex as complex,
   complex_p as complex_p,
+  composite as composite,
   concatenate as concatenate,
   concatenate_p as concatenate_p,
   conj as conj,
@@ -204,9 +204,12 @@ from jax._src.lax.lax import (
   sort as sort,
   sort_key_val as sort_key_val,
   sort_p as sort_p,
+  split as split,
+  split_p as split_p,
   sqrt as sqrt,
   sqrt_p as sqrt_p,
   square as square,
+  square_p as square_p,
   squeeze as squeeze,
   squeeze_p as squeeze_p,
   stop_gradient as stop_gradient,
@@ -331,7 +334,6 @@ from jax._src.lax.control_flow import (
   linear_solve_p as linear_solve_p,
   map as map,
   scan as scan,
-  scan_bind as scan_bind,
   scan_p as scan_p,
   switch as switch,
   while_loop as while_loop,
@@ -341,6 +343,7 @@ from jax._src.lax.control_flow import (
 from jax._src.lax.fft import (
   fft as fft,
   fft_p as fft_p,
+  FftType as FftType,
 )
 from jax._src.lax.parallel import (
   all_gather as all_gather,
@@ -362,6 +365,8 @@ from jax._src.lax.parallel import (
   psum_p as psum_p,
   psum_scatter as psum_scatter,
   pswapaxes as pswapaxes,
+  ragged_all_to_all as ragged_all_to_all,
+  ragged_all_to_all_p as ragged_all_to_all_p,
 )
 from jax._src.lax.other import (
   conv_general_dilated_local as conv_general_dilated_local,
@@ -378,16 +383,3 @@ from jax.lax import linalg as linalg
 from jax._src.pjit import with_sharding_constraint as with_sharding_constraint
 from jax._src.pjit import sharding_constraint_p as sharding_constraint_p
 from jax._src.dispatch import device_put_p as device_put_p
-
-
-_deprecations = {
-  # Finalized 2024-05-13; remove after 2024-08-13
-  "tie_in": (
-    "jax.lax.tie_in is deprecated: it has been a no-op since JAX v0.2.0. "
-    "Replace z = tie_in(x, y) with z = y.", None,
-  ),
-}
-
-from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
-__getattr__ = _deprecation_getattr(__name__, _deprecations)
-del _deprecation_getattr

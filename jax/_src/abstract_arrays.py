@@ -24,13 +24,10 @@ from jax._src import dtypes
 from jax._src import traceback_util
 traceback_util.register_exclusion(__file__)
 
-UnshapedArray = core.UnshapedArray
 ShapedArray = core.ShapedArray
-ConcreteArray = core.ConcreteArray
 AbstractToken = core.AbstractToken
 abstract_token = core.abstract_token
 canonicalize_shape = core.canonicalize_shape
-raise_to_shaped = core.raise_to_shaped
 
 numpy_scalar_types: set[type] = {  # pylint: disable=g-bare-generic
     dtypes.int4, np.int8, np.int16, np.int32, np.int64,
@@ -46,9 +43,6 @@ if dtypes.int2 is not None:
 
 array_types: set[type] = {np.ndarray} | numpy_scalar_types  # pylint: disable=g-bare-generic
 
-def canonical_concrete_aval(val, weak_type=None):
-  return ConcreteArray(dtypes.canonicalize_dtype(np.result_type(val)), val,
-                       weak_type=weak_type)
 
 def masked_array_error(*args, **kwargs):
   raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
@@ -56,17 +50,33 @@ def masked_array_error(*args, **kwargs):
 
 core.pytype_aval_mappings[np.ma.MaskedArray] = masked_array_error
 
-for t in array_types:
-  core.pytype_aval_mappings[t] = canonical_concrete_aval
+
+def _make_shaped_array_for_numpy_array(x: np.ndarray) -> ShapedArray:
+  dtype = x.dtype
+  dtypes.check_valid_dtype(dtype)
+  return ShapedArray(x.shape, dtypes.canonicalize_dtype(dtype))
+
+core.pytype_aval_mappings[np.ndarray] = _make_shaped_array_for_numpy_array
+
+
+def _make_shaped_array_for_numpy_scalar(x: np.generic) -> ShapedArray:
+  dtype = np.dtype(x)
+  dtypes.check_valid_dtype(dtype)
+  return ShapedArray(np.shape(x), dtypes.canonicalize_dtype(dtype))
+
+for t in numpy_scalar_types:
+  core.pytype_aval_mappings[t] = _make_shaped_array_for_numpy_scalar
 
 core.literalable_types.update(array_types)
 
-def _make_concrete_python_scalar(t, x):
-  dtype = dtypes._scalar_type_to_dtype(t, x)
-  weak_type = dtypes.is_weakly_typed(x)
-  return canonical_concrete_aval(np.array(x, dtype=dtype), weak_type=weak_type)
+
+def _make_abstract_python_scalar(typ, val):
+  # Note: all python scalar types are weak except bool, because bool only
+  # comes in a single width.
+  return ShapedArray((), dtypes._scalar_type_to_dtype(typ, val),
+                     weak_type=typ is not bool)
 
 for t in dtypes.python_scalar_dtypes:
-  core.pytype_aval_mappings[t] = partial(_make_concrete_python_scalar, t)
+  core.pytype_aval_mappings[t] = partial(_make_abstract_python_scalar, t)
 
 core.literalable_types.update(dtypes.python_scalar_dtypes.keys())

@@ -16,7 +16,7 @@
 This example is exactly the same as the one in the `FFI tutorial
 <https://jax.readthedocs.io/en/latest/ffi.html>`, so more details can be found
 on that page. But, the high level summary is that we implement our custom
-extension in ``rms_norm.cc``, then call it usin ``jax.extend.ffi.ffi_call`` in
+extension in ``rms_norm.cc``, then call it usin ``jax.ffi.ffi_call`` in
 this module. The behavior under autodiff is implemented using
 ``jax.custom_vjp``.
 """
@@ -26,13 +26,12 @@ from functools import partial
 import numpy as np
 
 import jax
-import jax.extend as jex
 import jax.numpy as jnp
 
 from jax_ffi_example import _rms_norm
 
 for name, target in _rms_norm.registrations().items():
-  jex.ffi.register_ffi_target(name, target)
+  jax.ffi.register_ffi_target(name, target)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
@@ -49,32 +48,28 @@ def rms_norm(x, eps=1e-5):
   # same shape and dtype as the input.
   out_type = jax.ShapeDtypeStruct(x.shape, x.dtype)
 
-  return jex.ffi.ffi_call(
+  # Note that here we're use `numpy` (not `jax.numpy`) to specify a dtype for
+  # the attribute `eps`. Our FFI function expects this to have the C++ `float`
+  # type (which corresponds to numpy's `float32` type), and it must be a
+  # static parameter (i.e. not a JAX array).
+  return jax.ffi.ffi_call(
     # The target name must be the same string as we used to register the target
     # above in `register_ffi_target`
     "rms_norm",
     out_type,
-    x,
-    # Note that here we're use `numpy` (not `jax.numpy`) to specify a dtype for
-    # the attribute `eps`. Our FFI function expects this to have the C++ `float`
-    # type (which corresponds to numpy's `float32` type), and it must be a
-    # static parameter (i.e. not a JAX array).
-    eps=np.float32(eps),
-    vmap_method="broadcast_fullrank",
-  )
+    vmap_method="broadcast_all",
+  )(x, eps=np.float32(eps))
 
 
 def rms_norm_fwd(x, eps=1e-5):
-  y, res = jex.ffi.ffi_call(
+  y, res = jax.ffi.ffi_call(
     "rms_norm_fwd",
     (
       jax.ShapeDtypeStruct(x.shape, x.dtype),
       jax.ShapeDtypeStruct(x.shape[:-1], x.dtype),
     ),
-    x,
-    eps=np.float32(eps),
-    vmap_method="broadcast_fullrank",
-  )
+    vmap_method="broadcast_all",
+  )(x, eps=np.float32(eps))
   return y, (res, x)
 
 
@@ -84,14 +79,11 @@ def rms_norm_bwd(eps, res, ct):
   assert res.shape == ct.shape[:-1]
   assert x.shape == ct.shape
   return (
-    jex.ffi.ffi_call(
+    jax.ffi.ffi_call(
       "rms_norm_bwd",
       jax.ShapeDtypeStruct(ct.shape, ct.dtype),
-      res,
-      x,
-      ct,
-      vmap_method="broadcast_fullrank",
-    ),
+      vmap_method="broadcast_all",
+    )(res, x, ct),
   )
 
 

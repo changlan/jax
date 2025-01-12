@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from functools import partial
 import operator
-from typing import cast, overload, Any
+from typing import cast, Any
 
 import numpy as np
 
@@ -67,6 +67,7 @@ def gammaln(x: ArrayLike) -> Array:
   return lax.lgamma(x)
 
 
+@jit
 def gammasgn(x: ArrayLike) -> Array:
   r"""Sign of the gamma function.
 
@@ -82,6 +83,13 @@ def gammasgn(x: ArrayLike) -> Array:
   Where :math:`\Gamma` is the :func:`~jax.scipy.special.gamma` function.
   Because :math:`\Gamma(x)` is never zero, no condition is required for this case.
 
+  * if :math:`x = -\infty`, NaN is returned.
+  * if :math:`x = \pm 0`, :math:`\pm 1` is returned.
+  * if :math:`x` is a negative integer, NaN is returned. The sign of gamma
+    at a negative integer depends on from which side the pole is approached.
+  * if :math:`x = \infty`, :math:`1` is returned.
+  * if :math:`x` is NaN, NaN is returned.
+
   Args:
     x: arraylike, real valued.
 
@@ -93,8 +101,14 @@ def gammasgn(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gammaln`: the natural log of the gamma function
   """
   x, = promote_args_inexact("gammasgn", x)
+  typ = x.dtype.type
   floor_x = lax.floor(x)
-  return jnp.where((x > 0) | (x == floor_x) | (floor_x % 2 == 0), 1.0, -1.0)
+  x_negative = x < 0
+  return jnp.select(
+    [(x_negative & (x == floor_x)) | jnp.isnan(x),
+     (x_negative & (floor_x % 2 != 0)) | ((x == 0) & jnp.signbit(x))],
+    [typ(np.nan), typ(-1.0)],
+    typ(1.0))
 
 
 def gamma(x: ArrayLike) -> Array:
@@ -116,6 +130,13 @@ def gamma(x: ArrayLike) -> Array:
 
      \Gamma(n) = (n - 1)!
 
+  * if :math:`z = -\infty`, NaN is returned.
+  * if :math:`x = \pm 0`, :math:`\pm \infty` is returned.
+  * if :math:`x` is a negative integer, NaN is returned. The sign of gamma
+    at a negative integer depends on from which side the pole is approached.
+  * if :math:`x = \infty`, :math:`\infty` is returned.
+  * if :math:`x` is NaN, NaN is returned.
+
   Args:
     x: arraylike, real valued.
 
@@ -128,7 +149,8 @@ def gamma(x: ArrayLike) -> Array:
     - :func:`jax.scipy.special.gammasgn`: the sign of the gamma function
 
   Notes:
-    Unlike the scipy version, JAX's ``gamma`` does not support complex-valued inputs.
+    Unlike the scipy version, JAX's ``gamma`` does not support complex-valued
+    inputs.
   """
   x, = promote_args_inexact("gamma", x)
   return gammasgn(x) * lax.exp(lax.lgamma(x))
@@ -189,16 +211,8 @@ def factorial(n: ArrayLike, exact: bool = False) -> Array:
   n, = promote_args_inexact("factorial", n)
   return jnp.where(n < 0, 0, lax.exp(lax.lgamma(n + 1)))
 
-@overload
-def beta(a: ArrayLike, b: ArrayLike) -> Array: ...
 
-@overload
-def beta(a: ArrayLike, *, y: ArrayLike) -> Array: ...
-
-@overload
-def beta(*, x: ArrayLike, y: ArrayLike) -> Array: ...
-
-def beta(*args, **kwds):
+def beta(a: ArrayLike, b: ArrayLike) -> Array:
   r"""The beta function
 
   JAX implementation of :obj:`scipy.special.beta`.
@@ -220,24 +234,6 @@ def beta(*args, **kwds):
     - :func:`jax.scipy.special.gamma`
     - :func:`jax.scipy.special.betaln`
   """
-  # TODO(jakevdp): deprecation warning added 2024-06-10; finalize after 2024-09-10
-  if 'x' in kwds:
-    msg = "The `x` parameter of jax.scipy.special.beta is deprecated, use `a` instead."
-    deprecations.warn('jax-scipy-beta-args', msg, stacklevel=2)
-    if 'a' in kwds:
-      raise TypeError("beta() got both parameter 'a' and parameter 'x'.")
-    kwds['a'] = kwds.pop('x')
-  if 'y' in kwds:
-    msg = "The `y` parameter of jax.scipy.special.beta is deprecated, use `b` instead."
-    deprecations.warn('jax-scipy-beta-args', msg, stacklevel=2)
-    if 'b' in kwds:
-      raise TypeError("beta() got both parameter 'b' and parameter 'y'.")
-    kwds['b'] = kwds.pop('y')
-  if extra := kwds.keys() - {'a', 'b'}:
-    raise TypeError(f"beta() got unexpected keyword arguments {list(extra)}")
-  return _beta(*args, **kwds)
-
-def _beta(a, b):
   a, b = promote_args_inexact("beta", a, b)
   sign = gammasgn(a) * gammasgn(b) * gammasgn(a + b)
   return sign * lax.exp(betaln(a, b))
@@ -1736,19 +1732,19 @@ def lpmn_values(m: int, n: int, z: Array, is_normalized: bool) -> Array:
 
 
 @partial(jit, static_argnums=(4,))
-def _sph_harm(m: Array,
-              n: Array,
+def _sph_harm(n: Array,
+              m: Array,
               theta: Array,
               phi: Array,
               n_max: int) -> Array:
   """Computes the spherical harmonics."""
 
-  cos_colatitude = jnp.cos(phi)
+  cos_colatitude = jnp.cos(theta)
 
   legendre = _gen_associated_legendre(n_max, cos_colatitude, True)
   legendre_val = legendre.at[abs(m), n, jnp.arange(len(n))].get(mode="clip")
 
-  angle = abs(m) * theta
+  angle = abs(m) * phi
   vandermonde = lax.complex(jnp.cos(angle), jnp.sin(angle))
   harmonics = lax.complex(legendre_val * jnp.real(vandermonde),
                           legendre_val * jnp.imag(vandermonde))
@@ -1761,12 +1757,69 @@ def _sph_harm(m: Array,
   return harmonics
 
 
+def sph_harm_y(n: Array,
+               m: Array,
+               theta: Array,
+               phi: Array,
+               diff_n: int | None = None,
+               n_max: int | None = None) -> Array:
+  r"""Computes the spherical harmonics.
+
+  The JAX version has one extra argument `n_max`, the maximum value in `n`.
+
+  The spherical harmonic of degree `n` and order `m` can be written as
+  :math:`Y_n^m(\theta, \phi) = N_n^m * P_n^m(\cos \theta) * \exp(i m \phi)`,
+  where :math:`N_n^m = \sqrt{\frac{\left(2n+1\right) \left(n-m\right)!}
+  {4 \pi \left(n+m\right)!}}` is the normalization factor and :math:`\theta` and
+  :math:`\phi` are the colatitude and longitude, respectively. :math:`N_n^m` is
+  chosen in the way that the spherical harmonics form a set of orthonormal basis
+  functions of :math:`L^2(S^2)`.
+
+  Args:
+    n: The degree of the harmonic; must have `n >= 0`. The standard notation for
+      degree in descriptions of spherical harmonics is `l (lower case L)`. We
+      use `n` here to be consistent with `scipy.special.sph_harm_y`. Return
+      values for `n < 0` are undefined.
+    m: The order of the harmonic; must have `|m| <= n`. Return values for
+      `|m| > n` are undefined.
+    theta: The polar (colatitudinal) coordinate; must be in [0, pi].
+    phi: The azimuthal (longitudinal) coordinate; must be in [0, 2*pi].
+    diff_n: Unsupported by JAX.
+    n_max: The maximum degree `max(n)`. If the supplied `n_max` is not the true
+      maximum value of `n`, the results are clipped to `n_max`. For example,
+      `sph_harm(m=jnp.array([2]), n=jnp.array([10]), theta, phi, n_max=6)`
+      actually returns
+      `sph_harm(m=jnp.array([2]), n=jnp.array([6]), theta, phi, n_max=6)`
+  Returns:
+    A 1D array containing the spherical harmonics at (m, n, theta, phi).
+  """
+  if diff_n is not None:
+    raise NotImplementedError(
+        "The 'diff_n' argument to jax.scipy.special.sph_harm_y is not supported.")
+
+  if jnp.isscalar(theta):
+    theta = jnp.array([theta])
+
+  if n_max is None:
+    n_max = np.max(n)
+  n_max = core.concrete_or_error(
+      int, n_max, 'The `n_max` argument of `jnp.scipy.special.sph_harm` must '
+      'be statically specified to use `sph_harm` within JAX transformations.')
+
+  return _sph_harm(n, m, theta, phi, n_max)
+
+
 def sph_harm(m: Array,
              n: Array,
              theta: Array,
              phi: Array,
              n_max: int | None = None) -> Array:
   r"""Computes the spherical harmonics.
+
+  Note:
+    This function is deprecated, and :func:`~jax.scipy.special.sph_harm_y`
+    should be used instead, noting that the order of ``m`` and ``n`` are
+    reversed, and definitions of ``theta`` and ``phi`` are swapped.
 
   The JAX version has one extra argument `n_max`, the maximum value in `n`.
 
@@ -1795,17 +1848,16 @@ def sph_harm(m: Array,
   Returns:
     A 1D array containing the spherical harmonics at (m, n, theta, phi).
   """
-
-  if jnp.isscalar(phi):
-    phi = jnp.array([phi])
-
-  if n_max is None:
-    n_max = np.max(n)
-  n_max = core.concrete_or_error(
-      int, n_max, 'The `n_max` argument of `jnp.scipy.special.sph_harm` must '
-      'be statically specified to use `sph_harm` within JAX transformations.')
-
-  return _sph_harm(m, n, theta, phi, n_max)
+  # Added 2025-01-06.
+  # TODO(dfm): Remove after deprecation period.
+  deprecations.warn(
+      "jax-scipy-special-sph-harm",
+      ("jax.scipy.special.sph_harm is deprecated. Please use "
+       "jax.scipy.special.sph_harm_y instead, noting that the order of `m` and "
+       "`n` are reversed, and definitions of `theta` and `phi` are swapped."),
+      stacklevel=2,
+  )
+  return sph_harm_y(n, m, phi, theta, n_max=n_max)
 
 
 # exponential integrals

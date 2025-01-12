@@ -21,6 +21,7 @@ import logging
 from typing import Any
 
 import jax
+from jax._src import config
 from jax._src import core
 from jax._src import deprecations
 from jax._src import dispatch
@@ -160,9 +161,22 @@ def callback_batching_rule(
   batched_result_avals = tuple(
       core.unmapped_aval(axis_size, core.no_axis_name, 0, aval)
       for aval in result_avals)
+
+  # For FFI calls we must update the layouts. We handle the output layouts
+  # here, but the input layout updates depend on the vmap_method parameter.
+  if vmap_method != "sequential" and kwargs.get("output_layouts") is not None:
+    kwargs["output_layouts"] = tuple(
+        None if layout is None else tuple(n + 1 for n in layout) + (0,)
+        for layout in kwargs["output_layouts"])
+
   if vmap_method == "legacy_vectorized":
     # This method is kept to support the behavior that was previously exposed
     # when using `vectorized=True`.
+    if kwargs.get("input_layouts") is not None:
+      kwargs["input_layouts"] = tuple(
+          layout if d is batching.not_mapped else
+          (None if layout is None else tuple(n + 1 for n in layout) + (0,))
+          for layout, d in zip(kwargs["input_layouts"], dims))
     outvals = prim.bind(
         *new_args,
         vectorized=vectorized,
@@ -170,11 +184,15 @@ def callback_batching_rule(
         result_avals=batched_result_avals,
         **kwargs,
     )
-  elif vmap_method == "broadcast" or vmap_method == "broadcast_fullrank":
-    size = axis_size if vmap_method == "broadcast_fullrank" else 1
+  elif vmap_method == "expand_dims" or vmap_method == "broadcast_all":
+    size = axis_size if vmap_method == "broadcast_all" else 1
     bcast_args = [
         lax.broadcast(x, (size,)) if d is batching.not_mapped else x
         for x, d in zip(new_args, dims)]
+    if kwargs.get("input_layouts") is not None:
+      kwargs["input_layouts"] = tuple(
+          None if layout is None else tuple(n + 1 for n in layout) + (0,)
+          for layout in kwargs["input_layouts"])
     outvals = prim.bind(
       *bcast_args,
       vectorized=vectorized,
@@ -198,7 +216,7 @@ def callback_batching_rule(
   else:
     raise NotImplementedError(
         f"vmap is only supported for the {prim.name} primitive when vmap_method "
-        "is one of 'sequential', 'broadcast', 'broadcast_fullrank', or "
+        "is one of 'sequential', 'expand_dims', 'broadcast_all', or "
         "'legacy_vectorized'.")
   return tuple(outvals), (0,) * len(outvals)
 
@@ -208,7 +226,9 @@ batching.primitive_batchers[pure_callback_p] = functools.partial(
 )
 
 
-def _callback_op_sharding(axis_context, sharding: SingleDeviceSharding | None):
+def _callback_op_sharding(
+    axis_context, sharding: SingleDeviceSharding | None, avals_out
+):
   if isinstance(axis_context, sharding_impls.SPMDAxisContext):
     # If we have fully manual sharding during lowering, that means the JAX
     # program has per-device semantics, so we run the callback on each device.
@@ -222,8 +242,18 @@ def _callback_op_sharding(axis_context, sharding: SingleDeviceSharding | None):
           "callbacks do not support specifying sharding inside spmd"
           " computations"
       )
-    op_sharding = xc.OpSharding()
-    op_sharding.type = xc.OpSharding.Type.MANUAL
+    if config.use_shardy_partitioner.value:
+      assert len(avals_out) == 1
+      op_sharding = sharding_impls.SdyArrayShardingList([
+          sharding_impls.SdyArraySharding(
+              mesh_shape=(),
+              dimension_shardings=[
+                  sharding_impls.SdyDimSharding(axes=[], is_closed=True)
+              ] * avals_out[0].ndim,
+              logical_device_ids=())])
+    else:
+      op_sharding = xc.OpSharding()  # type: ignore[assignment]
+      op_sharding.type = xc.OpSharding.Type.MANUAL
     return op_sharding
 
   if isinstance(axis_context, sharding_impls.ShardingContext):
@@ -251,10 +281,17 @@ def _callback_op_sharding(axis_context, sharding: SingleDeviceSharding | None):
     # If we have fully automatic sharding during lowering, that means the JAX
     # program has bulk array semantics, so we run the callback with a MAXIMAL
     # sharding and hence execute it only once on the full logical value).
-    op_sharding = xc.OpSharding()
-    op_sharding.type = xc.OpSharding.Type.MAXIMAL
-    op_sharding.tile_assignment_dimensions = [1]
-    op_sharding.tile_assignment_devices = [device_index]
+    if config.use_shardy_partitioner.value:
+      op_sharding = sharding_impls.SdyArrayShardingList([
+          sharding_impls.SdyArraySharding(
+              mesh_shape=(),
+              dimension_shardings=[],
+              logical_device_ids=(device_index,))])
+    else:
+      op_sharding = xc.OpSharding()  # type: ignore[assignment]
+      op_sharding.type = xc.OpSharding.Type.MAXIMAL
+      op_sharding.tile_assignment_dimensions = [1]
+      op_sharding.tile_assignment_devices = [device_index]
     return op_sharding
 
   # When there's no SPMD partitioning going on, don't annotate a sharding.
@@ -274,7 +311,8 @@ def pure_callback_lowering(
         )
     )
 
-  op_sharding = _callback_op_sharding(ctx.module_context.axis_context, sharding)
+  op_sharding = _callback_op_sharding(
+      ctx.module_context.axis_context, sharding, ctx.avals_out)
   result, _, _ = mlir.emit_python_callback(
       ctx,
       _callback,
@@ -326,10 +364,10 @@ def pure_callback(
   * Calling :func:`~jax.vmap` on a callback without an explicit ``vmap_method``
     is deprecated and it will eventually raise ``NotImplementedError``.
   * ``vmap_method="sequential"`` uses :func:`~jax.lax.map` to loop over
-    the batched arugments, calling ``callback`` once for each batch element.
-  * ``vmap_method="broadcast"`` calls ``callback`` with new axes of size ``1``
+    the batched arguments, calling ``callback`` once for each batch element.
+  * ``vmap_method="expand_dims"`` calls ``callback`` with new axes of size ``1``
     added as the leading dimension unbatched inputs.
-  * ``vmap_method="broadcast_fullrank"`` behaves like ``broadcast``, but the
+  * ``vmap_method="broadcast_all"`` behaves like ``expand_dims``, but the
     inputs are tiled to the expected batched shape.
 
   If necessary, the legacy behavior provided by the deprecated
@@ -383,20 +421,20 @@ def pure_callback(
     ...   return jax.pure_callback(callback, out_type, x, y,
     ...                            vmap_method=vmap_method)
 
-    Calling this with ``vmap_method="broadcast"`` adds a new axis of size ``1``
+    Calling this with ``vmap_method="expand_dims"`` adds a new axis of size ``1``
     to ``y``:
 
     >>> from functools import partial
     >>> x = jnp.arange(4)
     >>> y = 1.0
-    >>> jax.vmap(partial(fun, vmap_method="broadcast"), in_axes=(0, None))(x, y)
+    >>> jax.vmap(partial(fun, vmap_method="expand_dims"), in_axes=(0, None))(x, y)
     (4,) (1,)
     Array([1., 2., 3., 4.], dtype=float32)
 
-    Whereas, ``vmap_method="broadcast_fullrank"`` adds an axis of size ``4`` to
+    Whereas, ``vmap_method="broadcast_all"`` adds an axis of size ``4`` to
     ``y``:
 
-    >>> jax.vmap(partial(fun, vmap_method="broadcast_fullrank"),
+    >>> jax.vmap(partial(fun, vmap_method="broadcast_all"),
     ...          in_axes=(0, None))(x, y)
     (4,) (4,)
     Array([1., 2., 3., 4.], dtype=float32)
@@ -415,7 +453,7 @@ def pure_callback(
           "the vectorized and vmap_method arguments of jax.pure_callback cannot "
           "be used together. Please use the vmap_method argument.")
     vmap_method = "legacy_vectorized" if vectorized else "sequential"
-  allowed_vmap_methods = ["sequential", "broadcast", "broadcast_fullrank",
+  allowed_vmap_methods = ["sequential", "expand_dims", "broadcast_all",
                           "legacy_vectorized", None]
   if vmap_method not in allowed_vmap_methods:
     raise ValueError(
@@ -544,7 +582,8 @@ def io_callback_lowering(ctx, *args, callback, sharding, ordered, **params):
         )
     )
 
-  op_sharding = _callback_op_sharding(ctx.module_context.axis_context, sharding)
+  op_sharding = _callback_op_sharding(
+      ctx.module_context.axis_context, sharding, ctx.avals_out)
   if ordered:
     token = ctx.tokens_in.get(_OrderedIOEffect)
     result, token, _ = mlir.emit_python_callback(
@@ -559,7 +598,7 @@ def io_callback_lowering(ctx, *args, callback, sharding, ordered, **params):
     )
     ctx.set_tokens_out(mlir.TokenSet({_OrderedIOEffect: token}))
   else:
-    result, token, _ = mlir.emit_python_callback(
+    result, _, _ = mlir.emit_python_callback(
         ctx,
         _callback,
         None,
@@ -616,7 +655,6 @@ def io_callback(
   flat_shape_dtypes, out_tree = tree_util.tree_flatten(result_shape_dtypes)
   flat_result_avals = map(lambda x: core.ShapedArray(x.shape, x.dtype),
                           flat_shape_dtypes)
-  flat_args = map(core.raise_as_much_as_possible, flat_args)
   out_flat = io_callback_p.bind(
       *flat_args,
       callback=_FlatCallback(callback, in_tree),

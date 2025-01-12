@@ -49,7 +49,7 @@ ForwardRef._evaluate = _do_not_evaluate_in_jax
 # -- Project information -----------------------------------------------------
 
 project = 'JAX'
-copyright = '2024, The JAX Authors. NumPy and SciPy documentation are copyright the respective authors.'
+copyright = '2024, The JAX Authors'
 author = 'The JAX authors'
 
 # The short X.Y version
@@ -362,4 +362,5 @@ rediraffe_redirects = {
     'jax-101/index.rst': 'tutorials.rst',
     'notebooks/external_callbacks.md': 'external-callbacks.md',
     'notebooks/How_JAX_primitives_work.md': 'jax-primitives.md',
+    'jax.extend.ffi.rst': 'jax.ffi.rst',
 }

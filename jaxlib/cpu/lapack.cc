@@ -82,6 +82,11 @@ void GetLapackKernelsFromScipy() {
   AssignKernelFn<QrFactorization<DataType::C64>>(lapack_ptr("cgeqrf"));
   AssignKernelFn<QrFactorization<DataType::C128>>(lapack_ptr("zgeqrf"));
 
+  AssignKernelFn<PivotingQrFactorization<DataType::F32>>(lapack_ptr("sgeqp3"));
+  AssignKernelFn<PivotingQrFactorization<DataType::F64>>(lapack_ptr("dgeqp3"));
+  AssignKernelFn<PivotingQrFactorization<DataType::C64>>(lapack_ptr("cgeqp3"));
+  AssignKernelFn<PivotingQrFactorization<DataType::C128>>(lapack_ptr("zgeqp3"));
+
   AssignKernelFn<Orgqr<float>>(lapack_ptr("sorgqr"));
   AssignKernelFn<Orgqr<double>>(lapack_ptr("dorgqr"));
   AssignKernelFn<Orgqr<std::complex<float>>>(lapack_ptr("cungqr"));
@@ -137,6 +142,11 @@ void GetLapackKernelsFromScipy() {
   AssignKernelFn<RealGees<double>>(lapack_ptr("dgees"));
   AssignKernelFn<ComplexGees<std::complex<float>>>(lapack_ptr("cgees"));
   AssignKernelFn<ComplexGees<std::complex<double>>>(lapack_ptr("zgees"));
+  AssignKernelFn<SchurDecomposition<DataType::F32>>(lapack_ptr("sgees"));
+  AssignKernelFn<SchurDecomposition<DataType::F64>>(lapack_ptr("dgees"));
+  AssignKernelFn<SchurDecompositionComplex<DataType::C64>>(lapack_ptr("cgees"));
+  AssignKernelFn<SchurDecompositionComplex<DataType::C128>>(
+      lapack_ptr("zgees"));
 
   AssignKernelFn<Gehrd<float>>(lapack_ptr("sgehrd"));
   AssignKernelFn<Gehrd<double>>(lapack_ptr("dgehrd"));
@@ -151,6 +161,15 @@ void GetLapackKernelsFromScipy() {
   AssignKernelFn<Sytrd<double>>(lapack_ptr("dsytrd"));
   AssignKernelFn<Sytrd<std::complex<float>>>(lapack_ptr("chetrd"));
   AssignKernelFn<Sytrd<std::complex<double>>>(lapack_ptr("zhetrd"));
+  AssignKernelFn<TridiagonalReduction<DataType::F32>>(lapack_ptr("ssytrd"));
+  AssignKernelFn<TridiagonalReduction<DataType::F64>>(lapack_ptr("dsytrd"));
+  AssignKernelFn<TridiagonalReduction<DataType::C64>>(lapack_ptr("chetrd"));
+  AssignKernelFn<TridiagonalReduction<DataType::C128>>(lapack_ptr("zhetrd"));
+
+  AssignKernelFn<TridiagonalSolver<DataType::F32>>(lapack_ptr("sgtsv"));
+  AssignKernelFn<TridiagonalSolver<DataType::F64>>(lapack_ptr("dgtsv"));
+  AssignKernelFn<TridiagonalSolver<DataType::C64>>(lapack_ptr("cgtsv"));
+  AssignKernelFn<TridiagonalSolver<DataType::C128>>(lapack_ptr("zgtsv"));
 
   initialized = true;
 }
@@ -225,10 +244,10 @@ nb::dict Registrations() {
   dict["lapack_zhetrd"] =
       EncapsulateFunction(Sytrd<std::complex<double>>::Kernel);
 
-  dict["blas_strsm_ffi"] = EncapsulateFunction(blas_strsm_ffi);
-  dict["blas_dtrsm_ffi"] = EncapsulateFunction(blas_dtrsm_ffi);
-  dict["blas_ctrsm_ffi"] = EncapsulateFunction(blas_ctrsm_ffi);
-  dict["blas_ztrsm_ffi"] = EncapsulateFunction(blas_ztrsm_ffi);
+  dict["lapack_strsm_ffi"] = EncapsulateFunction(lapack_strsm_ffi);
+  dict["lapack_dtrsm_ffi"] = EncapsulateFunction(lapack_dtrsm_ffi);
+  dict["lapack_ctrsm_ffi"] = EncapsulateFunction(lapack_ctrsm_ffi);
+  dict["lapack_ztrsm_ffi"] = EncapsulateFunction(lapack_ztrsm_ffi);
   dict["lapack_sgetrf_ffi"] = EncapsulateFunction(lapack_sgetrf_ffi);
   dict["lapack_dgetrf_ffi"] = EncapsulateFunction(lapack_dgetrf_ffi);
   dict["lapack_cgetrf_ffi"] = EncapsulateFunction(lapack_cgetrf_ffi);
@@ -237,6 +256,10 @@ nb::dict Registrations() {
   dict["lapack_dgeqrf_ffi"] = EncapsulateFunction(lapack_dgeqrf_ffi);
   dict["lapack_cgeqrf_ffi"] = EncapsulateFunction(lapack_cgeqrf_ffi);
   dict["lapack_zgeqrf_ffi"] = EncapsulateFunction(lapack_zgeqrf_ffi);
+  dict["lapack_sgeqp3_ffi"] = EncapsulateFunction(lapack_sgeqp3_ffi);
+  dict["lapack_dgeqp3_ffi"] = EncapsulateFunction(lapack_dgeqp3_ffi);
+  dict["lapack_cgeqp3_ffi"] = EncapsulateFunction(lapack_cgeqp3_ffi);
+  dict["lapack_zgeqp3_ffi"] = EncapsulateFunction(lapack_zgeqp3_ffi);
   dict["lapack_sorgqr_ffi"] = EncapsulateFunction(lapack_sorgqr_ffi);
   dict["lapack_dorgqr_ffi"] = EncapsulateFunction(lapack_dorgqr_ffi);
   dict["lapack_cungqr_ffi"] = EncapsulateFunction(lapack_cungqr_ffi);
@@ -257,10 +280,22 @@ nb::dict Registrations() {
   dict["lapack_dgeev_ffi"] = EncapsulateFunction(lapack_dgeev_ffi);
   dict["lapack_cgeev_ffi"] = EncapsulateFunction(lapack_cgeev_ffi);
   dict["lapack_zgeev_ffi"] = EncapsulateFunction(lapack_zgeev_ffi);
+  dict["lapack_ssytrd_ffi"] = EncapsulateFunction(lapack_ssytrd_ffi);
+  dict["lapack_dsytrd_ffi"] = EncapsulateFunction(lapack_dsytrd_ffi);
+  dict["lapack_chetrd_ffi"] = EncapsulateFunction(lapack_chetrd_ffi);
+  dict["lapack_zhetrd_ffi"] = EncapsulateFunction(lapack_zhetrd_ffi);
+  dict["lapack_sgees_ffi"] = EncapsulateFunction(lapack_sgees_ffi);
+  dict["lapack_dgees_ffi"] = EncapsulateFunction(lapack_dgees_ffi);
+  dict["lapack_cgees_ffi"] = EncapsulateFunction(lapack_cgees_ffi);
+  dict["lapack_zgees_ffi"] = EncapsulateFunction(lapack_zgees_ffi);
   dict["lapack_sgehrd_ffi"] = EncapsulateFunction(lapack_sgehrd_ffi);
   dict["lapack_dgehrd_ffi"] = EncapsulateFunction(lapack_dgehrd_ffi);
   dict["lapack_cgehrd_ffi"] = EncapsulateFunction(lapack_cgehrd_ffi);
   dict["lapack_zgehrd_ffi"] = EncapsulateFunction(lapack_zgehrd_ffi);
+  dict["lapack_sgtsv_ffi"] = EncapsulateFunction(lapack_sgtsv_ffi);
+  dict["lapack_dgtsv_ffi"] = EncapsulateFunction(lapack_dgtsv_ffi);
+  dict["lapack_cgtsv_ffi"] = EncapsulateFunction(lapack_cgtsv_ffi);
+  dict["lapack_zgtsv_ffi"] = EncapsulateFunction(lapack_zgtsv_ffi);
 
   return dict;
 }
@@ -272,6 +307,7 @@ NB_MODULE(_lapack, m) {
   // Submodules
   auto svd = m.def_submodule("svd");
   auto eig = m.def_submodule("eig");
+  auto schur = m.def_submodule("schur");
   // Enums
   nb::enum_<svd::ComputationMode>(svd, "ComputationMode")
       // kComputeVtOverwriteXPartialU is not implemented
@@ -281,6 +317,14 @@ NB_MODULE(_lapack, m) {
   nb::enum_<eig::ComputationMode>(eig, "ComputationMode")
       .value("kComputeEigenvectors", eig::ComputationMode::kComputeEigenvectors)
       .value("kNoEigenvectors", eig::ComputationMode::kNoEigenvectors);
+  nb::enum_<schur::ComputationMode>(schur, "ComputationMode")
+      .value("kNoComputeSchurVectors",
+             schur::ComputationMode::kNoComputeSchurVectors)
+      .value("kComputeSchurVectors",
+             schur::ComputationMode::kComputeSchurVectors);
+  nb::enum_<schur::Sort>(schur, "Sort")
+      .value("kNoSortEigenvalues", schur::Sort::kNoSortEigenvalues)
+      .value("kSortEigenvalues", schur::Sort::kSortEigenvalues);
 
   // Old-style LAPACK Workspace Size Queries
   m.def("lapack_sgeqrf_workspace", &Geqrf<float>::Workspace, nb::arg("m"),

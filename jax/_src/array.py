@@ -22,9 +22,7 @@ import math
 import operator as op
 from typing import Any, TYPE_CHECKING, cast
 
-from jax._src import abstract_arrays
 from jax._src import api
-from jax._src import api_util
 from jax._src import basearray
 from jax._src import config
 from jax._src import core
@@ -33,6 +31,7 @@ from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import errors
 from jax._src import profiler
+from jax._src import util
 from jax._src import xla_bridge
 from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
@@ -275,6 +274,10 @@ class ArrayImpl(basearray.Array):
   @property
   def weak_type(self):
     return self.aval.weak_type
+
+  @property
+  def committed(self) -> bool:
+    return self._committed
 
   def __str__(self):
     return str(self._value)
@@ -1022,17 +1025,18 @@ def make_array_from_single_device_arrays(
   return ArrayImpl(aval, sharding, cast(Sequence[ArrayImpl], arrays),
                    committed=True)
 
-
-core.pytype_aval_mappings[ArrayImpl] = abstract_arrays.canonical_concrete_aval
-xla.pytype_aval_mappings[ArrayImpl] = op.attrgetter('aval')
 xla.canonicalize_dtype_handlers[ArrayImpl] = pxla.identity
+
 def _get_aval_array(self):
   if config.sharding_in_types.value and isinstance(self.sharding, NamedSharding):
     return self.aval.update(sharding=NamedSharding(
-        self.sharding.mesh.abstract_mesh, self.sharding.spec))
+        self.sharding.mesh.abstract_mesh,
+        self.sharding.spec._normalized_spec(self.ndim)))
   else:
     return self.aval
-api_util._shaped_abstractify_handlers[ArrayImpl] = _get_aval_array
+
+core.pytype_aval_mappings[ArrayImpl] = _get_aval_array
+
 # TODO(jakevdp) replace this with true inheritance at the C++ level.
 basearray.Array.register(ArrayImpl)
 
@@ -1089,7 +1093,7 @@ def shard_device_array(x, devices, indices, sharding):
     shards = [x] * len(devices)
   else:
     shards = x._multi_slice(start_indices, limit_indices, removed_dims)
-  aval = api_util.shaped_abstractify(x)
+  aval = core.shaped_abstractify(x)
   return pxla.batched_device_put(aval, sharding, shards, devices)
 
 
@@ -1105,7 +1109,7 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
     # Look up all buffers that contain the correct slice of the logical array.
     candidates_list = candidates[hashed_index(idx)]
     if not candidates_list:
-      return pxla.shard_args([sharding], [None], [x._value],
+      return pxla.shard_args([sharding], [None], [None], [x._value],
                              canonicalize=False)[0]
     # Try to find a candidate buffer already on the correct device,
     # otherwise copy one of them.
@@ -1114,7 +1118,7 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
         bufs.append(buf)
         break
     else:
-      bufs.append(buf)
+      bufs.append(candidates_list[-1])
   return pxla.batched_device_put(x.aval, sharding, bufs, devices)
 
 
@@ -1125,11 +1129,14 @@ def _sharding_indices_and_eq(src_sharding, shape, dst_sharding):
   return dst_indices, tuple(src_indices) == tuple(dst_indices)
 
 
-def _array_shard_arg(xs, shardings, layouts):
+def _array_shard_arg(xs, shardings, layouts, copy_semantics):
+  util.test_event("_array_shard_arg")
   results = []
   batch_xs, batch_devs, batch_shardings, batch_indices = [], [], [], []
+  batch_cs = []
 
-  for i, (x, sharding, layout) in enumerate(safe_zip(xs, shardings, layouts)):
+  for i, (x, sharding, layout, cs) in enumerate(
+      safe_zip(xs, shardings, layouts, copy_semantics)):
     x._check_if_deleted()
     indices, same_indices = _sharding_indices_and_eq(x.sharding, x.shape, sharding)
     same_layout = (True if layout is None else
@@ -1151,6 +1158,7 @@ def _array_shard_arg(xs, shardings, layouts):
         batch_devs.append(list(devices))
         batch_shardings.append(sharding)
         batch_indices.append(i)
+        batch_cs.append(cs)
       # Resharding starts here:
       elif not same_layout:
         results.append(api.device_put(x, Layout(layout, sharding)))
@@ -1160,8 +1168,9 @@ def _array_shard_arg(xs, shardings, layouts):
         results.append(
             shard_sharded_device_array_slow_path(x, devices, indices, sharding))
 
+  util.test_event("batched_copy_array")
   copy_outs = xc.batched_copy_array_to_devices_with_sharding(
-      batch_xs, batch_devs, batch_shardings)
+      batch_xs, batch_devs, batch_shardings, batch_cs)
   for i, copy_out in safe_zip(batch_indices, copy_outs):
     assert results[i] is None
     results[i] = copy_out
@@ -1179,7 +1188,6 @@ def _array_global_result_handler(global_aval, out_sharding, committed):
       global_aval, out_sharding, committed=committed, _skip_checks=True
   )
 pxla.global_result_handlers[core.ShapedArray] = _array_global_result_handler
-pxla.global_result_handlers[core.ConcreteArray] = _array_global_result_handler
 
 # Only used for Arrays that come out of pmap.
 def _array_local_result_handler(aval, sharding, indices):
@@ -1192,13 +1200,13 @@ def _array_local_result_handler(aval, sharding, indices):
       aval, sharding, committed=True, _skip_checks=True
   )
 pxla.local_result_handlers[core.ShapedArray] = _array_local_result_handler
-pxla.local_result_handlers[core.ConcreteArray] = _array_local_result_handler
 
 
 # Token handlers
 
-def _token_shard_arg(xs, shardings, layouts):
-  return _array_shard_arg([x._buf for x in xs], shardings, layouts)
+def _token_shard_arg(xs, shardings, layouts, copy_semantics):
+  return _array_shard_arg([x._buf for x in xs], shardings, layouts,
+                          copy_semantics)
 pxla.shard_arg_handlers[core.Token] = _token_shard_arg
 
 

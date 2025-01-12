@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef JAXLIB_CPU_LAPACK_KERNELS_H_
 #define JAXLIB_CPU_LAPACK_KERNELS_H_
 
+#include <complex>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -26,7 +27,7 @@ limitations under the License.
 #include "xla/service/custom_call_status.h"
 
 // Underlying function pointers (i.e., KERNEL_CLASS::Fn) are initialized either
-// by the pybind wrapper that links them to an existing SciPy lapack instance,
+// by the nanobind wrapper that links them to an existing SciPy lapack instance,
 // or using the lapack_kernels_strong.cc static initialization to link them
 // directly to lapack for use in a pure C++ context.
 
@@ -67,7 +68,18 @@ enum class ComputationMode : char {
   kComputeEigenvectors = 'V',
 };
 
-}
+}  // namespace eig
+
+namespace schur {
+
+enum class ComputationMode : char {
+  kNoComputeSchurVectors = 'N',
+  kComputeSchurVectors = 'V',
+};
+
+enum class Sort : char { kNoSortEigenvalues = 'N', kSortEigenvalues = 'S' };
+
+}  // namespace schur
 
 template <typename KernelType>
 void AssignKernelFn(void* func) {
@@ -96,6 +108,8 @@ DEFINE_CHAR_ENUM_ATTR_DECODING(jax::MatrixParams::Transpose);
 DEFINE_CHAR_ENUM_ATTR_DECODING(jax::MatrixParams::Diag);
 DEFINE_CHAR_ENUM_ATTR_DECODING(jax::svd::ComputationMode);
 DEFINE_CHAR_ENUM_ATTR_DECODING(jax::eig::ComputationMode);
+DEFINE_CHAR_ENUM_ATTR_DECODING(jax::schur::ComputationMode);
+DEFINE_CHAR_ENUM_ATTR_DECODING(jax::schur::Sort);
 
 #undef DEFINE_CHAR_ENUM_ATTR_DECODING
 
@@ -198,6 +212,34 @@ struct QrFactorization {
 
   static int64_t GetWorkspaceSize(lapack_int x_rows, lapack_int x_cols);
 };
+
+//== Column Pivoting QR Factorization ==//
+
+// lapack geqp3
+template <::xla::ffi::DataType dtype>
+struct PivotingQrFactorization {
+  using RealType = ::xla::ffi::NativeType<::xla::ffi::ToReal(dtype)>;
+  using ValueType = ::xla::ffi::NativeType<dtype>;
+  using FnType = std::conditional_t<
+      ::xla::ffi::IsComplexType<dtype>(),
+      void(lapack_int* m, lapack_int* n, ValueType* a, lapack_int* lda,
+           lapack_int* jpvt, ValueType* tau, ValueType* work, lapack_int* lwork,
+           RealType* rwork, lapack_int* info),
+      void(lapack_int* m, lapack_int* n, ValueType* a, lapack_int* lda,
+           lapack_int* jpvt, ValueType* tau, ValueType* work, lapack_int* lwork,
+           lapack_int* info)>;
+
+  inline static FnType* fn = nullptr;
+
+  static ::xla::ffi::Error Kernel(
+      ::xla::ffi::Buffer<dtype> x, ::xla::ffi::Buffer<LapackIntDtype> jpvt,
+      ::xla::ffi::ResultBuffer<dtype> x_out,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> jpvt_out,
+      ::xla::ffi::ResultBuffer<dtype> tau);
+
+  static int64_t GetWorkspaceSize(lapack_int x_rows, lapack_int x_cols);
+};
+
 
 //== Orthogonal QR ==//
 
@@ -449,6 +491,34 @@ struct EigenvalueDecompositionHermitian {
 
 // lapack geev
 
+// LAPACK uses a packed representation to represent a mixture of real
+// eigenvectors and complex conjugate pairs. This helper unpacks the
+// representation into regular complex matrices.
+template <typename T, typename Int = lapack_int>
+static void UnpackEigenvectors(Int n, const T* eigenvals_imag, const T* packed,
+                               std::complex<T>* unpacked) {
+  for (int j = 0; j < n;) {
+    if (eigenvals_imag[j] == 0. || std::isnan(eigenvals_imag[j])) {
+      // Real values in each row without imaginary part
+      // Second row of the imaginary part is not provided
+      for (int i = 0; i < n; ++i) {
+        unpacked[j * n + i] = {packed[j * n + i], 0.};
+      }
+      ++j;
+    } else {
+      // Complex values where the real part is in the jth row
+      // and the imaginary part is in the next row (j + 1)
+      for (int i = 0; i < n; ++i) {
+        const T real_part = packed[j * n + i];
+        const T imag_part = packed[(j + 1) * n + i];
+        unpacked[j * n + i] = {real_part, imag_part};
+        unpacked[(j + 1) * n + i] = {real_part, -imag_part};
+      }
+      j += 2;
+    }
+  }
+}
+
 template <typename T>
 struct RealGeev {
   using FnType = void(char* jobvl, char* jobvr, lapack_int* n, T* a,
@@ -551,6 +621,64 @@ struct ComplexGees {
   static void Kernel(void* out, void** data, XlaCustomCallStatus*);
 };
 
+// FFI Kernel
+
+template <::xla::ffi::DataType dtype>
+struct SchurDecomposition {
+  static_assert(!::xla::ffi::IsComplexType<dtype>(),
+                "There exists a separate implementation for Complex types");
+
+  using ValueType = ::xla::ffi::NativeType<dtype>;
+  using FnType = void(char* jobvs, char* sort,
+                      bool (*select)(ValueType, ValueType), lapack_int* n,
+                      ValueType* a, lapack_int* lda, lapack_int* sdim,
+                      ValueType* wr, ValueType* wi, ValueType* vs,
+                      lapack_int* ldvs, ValueType* work, lapack_int* lwork,
+                      bool* bwork, lapack_int* info);
+
+  inline static FnType* fn = nullptr;
+
+  static ::xla::ffi::Error Kernel(
+      ::xla::ffi::Buffer<dtype> x, schur::ComputationMode mode,
+      schur::Sort sort, ::xla::ffi::ResultBuffer<dtype> x_out,
+      ::xla::ffi::ResultBuffer<dtype> schur_vectors,
+      ::xla::ffi::ResultBuffer<dtype> eigvals_real,
+      ::xla::ffi::ResultBuffer<dtype> eigvals_imag,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> selected_eigvals,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> info);
+
+  static int64_t GetWorkspaceSize(lapack_int x_cols,
+                                  schur::ComputationMode mode,
+                                  schur::Sort sort);
+};
+
+template <::xla::ffi::DataType dtype>
+struct SchurDecompositionComplex {
+  static_assert(::xla::ffi::IsComplexType<dtype>());
+
+  using ValueType = ::xla::ffi::NativeType<dtype>;
+  using RealType = ::xla::ffi::NativeType<::xla::ffi::ToReal(dtype)>;
+  using FnType = void(char* jobvs, char* sort, bool (*select)(ValueType),
+                      lapack_int* n, ValueType* a, lapack_int* lda,
+                      lapack_int* sdim, ValueType* w, ValueType* vs,
+                      lapack_int* ldvs, ValueType* work, lapack_int* lwork,
+                      RealType* rwork, bool* bwork, lapack_int* info);
+
+  inline static FnType* fn = nullptr;
+
+  static ::xla::ffi::Error Kernel(
+      ::xla::ffi::Buffer<dtype> x, schur::ComputationMode mode,
+      schur::Sort sort, ::xla::ffi::ResultBuffer<dtype> x_out,
+      ::xla::ffi::ResultBuffer<dtype> schur_vectors,
+      ::xla::ffi::ResultBuffer<dtype> eigvals,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> selected_eigvals,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> info);
+
+  static int64_t GetWorkspaceSize(lapack_int x_cols,
+                                  schur::ComputationMode mode,
+                                  schur::Sort sort);
+};
+
 //== Hessenberg Decomposition                                       ==//
 //== Reduces a non-symmetric square matrix to upper Hessenberg form ==//
 
@@ -617,11 +745,54 @@ struct Sytrd {
   static int64_t Workspace(lapack_int lda, lapack_int n);
 };
 
+// FFI Kernel
+
+template <::xla::ffi::DataType dtype>
+struct TridiagonalReduction {
+  using ValueType = ::xla::ffi::NativeType<dtype>;
+  using RealType = ::xla::ffi::NativeType<::xla::ffi::ToReal(dtype)>;
+  using FnType = void(char* uplo, lapack_int* n, ValueType* a, lapack_int* lda,
+                      RealType* d, RealType* e, ValueType* tau, ValueType* work,
+                      lapack_int* lwork, lapack_int* info);
+
+  inline static FnType* fn = nullptr;
+
+  static ::xla::ffi::Error Kernel(
+      ::xla::ffi::Buffer<dtype> x, MatrixParams::UpLo uplo,
+      ::xla::ffi::ResultBuffer<dtype> x_out,
+      ::xla::ffi::ResultBuffer<::xla::ffi::ToReal(dtype)> diagonal,
+      ::xla::ffi::ResultBuffer<::xla::ffi::ToReal(dtype)> off_diagonal,
+      ::xla::ffi::ResultBuffer<dtype> tau,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> info);
+
+  static int64_t GetWorkspaceSize(lapack_int x_rows, lapack_int x_cols);
+};
+
+//== General Tridiagonal System Solver ==//
+
+template <::xla::ffi::DataType dtype>
+struct TridiagonalSolver {
+  using ValueType = ::xla::ffi::NativeType<dtype>;
+  using FnType = void(lapack_int* n, lapack_int* nrhs, ValueType* dl,
+                      ValueType* d, ValueType* du, ValueType* b,
+                      lapack_int* ldb, lapack_int* info);
+
+  inline static FnType* fn = nullptr;
+  static ::xla::ffi::Error Kernel(
+      ::xla::ffi::Buffer<dtype> dl, ::xla::ffi::Buffer<dtype> d,
+      ::xla::ffi::Buffer<dtype> du, ::xla::ffi::Buffer<dtype> b,
+      ::xla::ffi::ResultBuffer<dtype> dl_out,
+      ::xla::ffi::ResultBuffer<dtype> d_out,
+      ::xla::ffi::ResultBuffer<dtype> du_out,
+      ::xla::ffi::ResultBuffer<dtype> b_out,
+      ::xla::ffi::ResultBuffer<LapackIntDtype> info);
+};
+
 // Declare all the handler symbols
-XLA_FFI_DECLARE_HANDLER_SYMBOL(blas_strsm_ffi);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(blas_dtrsm_ffi);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(blas_ctrsm_ffi);
-XLA_FFI_DECLARE_HANDLER_SYMBOL(blas_ztrsm_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_strsm_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dtrsm_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_ctrsm_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_ztrsm_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgetrf_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgetrf_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgetrf_ffi);
@@ -630,6 +801,10 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgeqrf_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgeqrf_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgeqrf_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgeqrf_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgeqp3_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgeqp3_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgeqp3_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgeqp3_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sorgqr_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dorgqr_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cungqr_ffi);
@@ -650,10 +825,22 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgeev_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgeev_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgeev_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgeev_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_ssytrd_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dsytrd_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_chetrd_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zhetrd_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgees_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgees_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgees_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgees_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgehrd_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgehrd_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgehrd_ffi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgehrd_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_sgtsv_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_dgtsv_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_cgtsv_ffi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(lapack_zgtsv_ffi);
 
 }  // namespace jax
 
