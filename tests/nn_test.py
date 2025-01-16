@@ -24,11 +24,10 @@ from absl.testing import parameterized
 
 import scipy.stats
 
+from jax._src import ad_checkpoint
 from jax._src import config
 from jax._src import core
 from jax._src import test_util as jtu
-from jax._src import ad_checkpoint
-from jax._src.interpreters import mlir
 from jax._src.lib import cuda_versions
 from jax.test_util import check_grads
 from jax import nn
@@ -47,7 +46,7 @@ def _is_required_cudnn_version_satisfied(min_cudnn_version):
 
 def _check_cudnn_backend(fn, *args, **kwargs):
   lowered = jax.jit(fn).lower(*args, **kwargs)
-  hlo = mlir.module_to_string(lowered.compiler_ir('stablehlo'))
+  hlo = lowered.as_text('stablehlo', debug_info=True)
   return '__cudnn$fmha' in hlo
 
 _cudnn_dbias_error = 'cuDNN only supports bias gradient'
@@ -99,8 +98,8 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
     self.assertAllClose(out_ref, out_ans, atol=.01, rtol=.01)
     self.assertAllClose(dQ_ref, dQ_ans, rtol=.01, atol=.01)
-    self.assertAllClose(dK_ref, dK_ans, rtol=.02, atol=.02)
-    self.assertAllClose(dV_ref, dV_ans, rtol=.02, atol=.02)
+    self.assertAllClose(dK_ref, dK_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dV_ref, dV_ans, rtol=.01, atol=.01)
 
   @parameterized.product(
       mask_mode=['bias', 'causal', 'padding', 'custom', ('causal', 'padding'),
@@ -164,10 +163,10 @@ class NNFunctionsTest(jtu.JaxTestCase):
     self.assertTrue(_check_cudnn_backend(sdpa_vjp_ans, grad))
 
     self.assertAllClose(out_ref, out_ans, atol=.01, rtol=.01)
-    self.assertAllClose(dQ_ref, dQ_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dQ_ref, dQ_ans, rtol=.02, atol=.02)
     self.assertAllClose(dK_ref, dK_ans, rtol=.02, atol=.02)
-    self.assertAllClose(dV_ref, dV_ans, rtol=.02, atol=.02)
-    self.assertAllClose(dbias_ref, dbias_ans, rtol=.03, atol=.03)
+    self.assertAllClose(dV_ref, dV_ans, rtol=.01, atol=.01)
+    self.assertAllClose(dbias_ref, dbias_ans, rtol=.02, atol=.02)
 
   @parameterized.product(
       batch_size=[1, 16],
@@ -224,7 +223,7 @@ class NNFunctionsTest(jtu.JaxTestCase):
     else:
       _, dbias_ref, _ = bwd_ref(x, bias, mask)
       _, dbias_ans, _ = bwd_ans(x, bias, mask)
-      self.assertAllClose(dbias_ans, dbias_ref, rtol=.03, atol=.03)
+      self.assertAllClose(dbias_ans, dbias_ref, rtol=.02, atol=.02)
 
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def testSoftplusGrad(self):
@@ -316,6 +315,11 @@ class NNFunctionsTest(jtu.JaxTestCase):
     check_grads(nn.relu, (-1.,), order=3, rtol=rtol)
     jaxpr = jax.make_jaxpr(jax.grad(nn.relu))(0.)
     self.assertGreaterEqual(len(jaxpr.jaxpr.eqns), 2)
+
+  def testReluGradAtZero(self):
+    # https://dl.acm.org/doi/10.5555/3540261.3540297
+    grad = jax.grad(nn.relu)(0.)
+    self.assertEqual(grad, 0.)
 
   def testRelu6Grad(self):
     rtol = 1e-2 if jtu.test_device_matches(["tpu"]) else None
@@ -524,6 +528,11 @@ class NNFunctionsTest(jtu.JaxTestCase):
 
     actual = nn.one_hot(jnp.array([1, 2, 0]), 3, axis=-2)
     self.assertAllClose(actual, expected, check_dtypes=False)
+
+  def testOneHotNonInteger(self):
+    with self.assertDeprecationWarnsOrRaises("jax-nn-one-hot-float-input",
+                                             "jax.nn.one_hot input should be integer-typed"):
+      nn.one_hot(jnp.array([1.0]), 3)
 
   def testTanhExists(self):
     nn.tanh  # doesn't crash

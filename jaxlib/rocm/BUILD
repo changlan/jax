@@ -18,7 +18,7 @@ load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
     "if_rocm_is_configured",
-    "pybind_extension",
+    "nanobind_extension",
     "rocm_library",
 )
 
@@ -113,7 +113,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_blas",
     srcs = ["//jaxlib/gpu:blas.cc"],
     copts = [
@@ -132,6 +132,44 @@ pybind_extension(
         "@local_config_rocm//rocm:rocm_headers",
         "@nanobind",
         "@xla//xla/tsl/python/lib/core:numpy",
+    ],
+)
+
+cc_library(
+    name = "miopen_rnn_kernels",
+    srcs = ["//jaxlib/gpu:rnn_kernels.cc"],
+    hdrs = ["//jaxlib/gpu:rnn_kernels.h"],
+    deps = [
+        ":hip_gpu_kernel_helpers",
+        ":hip_vendor",
+        "//jaxlib:handle_pool",
+        "//jaxlib:kernel_helpers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@local_config_rocm//rocm:miopen",
+        "@local_config_rocm//rocm:rocm_headers",
+        "@xla//xla/service:custom_call_status",
+    ],
+)
+
+nanobind_extension(
+    name = "_rnn",
+    srcs = ["//jaxlib/gpu:rnn.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    module_name = "_rnn",
+    deps = [
+        ":hip_vendor",
+        ":miopen_rnn_kernels",
+        "//jaxlib:absl_status_casters",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:str_format",
+        "@nanobind",
     ],
 )
 
@@ -206,7 +244,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_solver",
     srcs = ["//jaxlib/gpu:solver.cc"],
     copts = [
@@ -252,7 +290,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_sparse",
     srcs = ["//jaxlib/gpu:sparse.cc"],
     copts = [
@@ -289,6 +327,7 @@ cc_library(
     hdrs = ["//jaxlib/gpu:linalg_kernels.h"],
     features = ["-use_header_modules"],
     deps = [
+        ":hip_blas_handle_pool",
         ":hip_gpu_kernel_helpers",
         ":hip_linalg_kernels_impl",
         ":hip_vendor",
@@ -316,7 +355,7 @@ rocm_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_linalg",
     srcs = ["//jaxlib/gpu:linalg.cc"],
     copts = [
@@ -369,7 +408,7 @@ rocm_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_prng",
     srcs = ["//jaxlib/gpu:prng.cc"],
     copts = [
@@ -385,6 +424,49 @@ pybind_extension(
         "//jaxlib:kernel_nanobind_helpers",
         "@local_config_rocm//rocm:rocm_headers",
         "@nanobind",
+    ],
+)
+
+cc_library(
+    name = "hip_hybrid_kernels",
+    srcs = ["//jaxlib/gpu:hybrid_kernels.cc"],
+    hdrs = ["//jaxlib/gpu:hybrid_kernels.h"],
+    deps = [
+        ":hip_gpu_kernel_helpers",
+        ":hip_vendor",
+        "//jaxlib:ffi_helpers",
+        "//jaxlib/cpu:lapack_kernels",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/ffi/api:ffi",
+    ],
+)
+
+nanobind_extension(
+    name = "_hybrid",
+    srcs = ["//jaxlib/gpu:hybrid.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    module_name = "_hybrid",
+    deps = [
+        ":hip_gpu_kernel_helpers",
+        ":hip_hybrid_kernels",
+        ":hip_vendor",
+        "//jaxlib:kernel_nanobind_helpers",
+        "//jaxlib/cpu:lapack_kernels",
+        "@com_google_absl//absl/base",
+        "@local_config_rocm//rocm:rocm_headers",
+        "@nanobind",
+        "@xla//xla/ffi/api:ffi",
     ],
 )
 
@@ -429,7 +511,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_triton",
     srcs = ["//jaxlib/gpu:triton.cc"],
     copts = [
@@ -455,8 +537,10 @@ py_library(
     name = "rocm_gpu_support",
     deps = [
         ":_blas",
+        ":_hybrid",
         ":_linalg",
         ":_prng",
+        ":_rnn",
         ":_solver",
         ":_sparse",
         ":_triton",

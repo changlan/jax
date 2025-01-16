@@ -21,8 +21,8 @@ load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 #    curl -L https://github.com/openxla/xla/archive/<git hash>.tar.gz | sha256sum
 #    and update XLA_SHA256 with the result.
 
-XLA_COMMIT = "0b058d5ddeae050c9dc3ed93ac179f07037f840b"
-XLA_SHA256 = "29d8a871b9920b47c3659479fb1577a08cce19ac93dfe1dceab86b6fbeb25b55"
+XLA_COMMIT = "370a76e2d5bc0c772e61f7c11ebf34c74febf827"
+XLA_SHA256 = "720b35f3f2be990628c8c411cd7aea08b10f5f56eddb345bd20d8a402d06c60d"
 
 def repo():
     tf_http_archive(
@@ -37,7 +37,7 @@ def repo():
     # local checkout by either:
     # a) overriding the TF repository on the build.py command line by passing a flag
     #    like:
-    #    python build/build.py --bazel_options=--override_repository=xla=/path/to/xla
+    #    python build/build.py build --local_xla_path=/path/to/xla
     #    or
     # b) by commenting out the http_archive above and uncommenting the following:
     # local_repository(

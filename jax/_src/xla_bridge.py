@@ -90,6 +90,13 @@ _MOCK_NUM_GPU_PROCESSES = config.int_flag(
     help="Mock number of JAX processes in GPU client. Value zero turns "
          "off mocking.",
 )
+_MOCK_GPU_TOPOLOGY = config.string_flag(
+    name="jax_mock_gpu_topology",
+    default="",
+    help='Mock multi-host GPU topology in GPU client. The value should '
+         'be of the form "<number-of-slices> x <number-of-hosts-per-slice> x '
+         '<number-of-devices-per-host>". Empty string turns off mocking.',
+)
 
 _CPU_ENABLE_GLOO_COLLECTIVES = config.bool_flag(
     name="jax_cpu_enable_gloo_collectives",
@@ -113,6 +120,14 @@ _CPU_ENABLE_ASYNC_DISPATCH = config.bool_flag(
     default=True,
     help="Only applies to non-parallel computations. If False, run computations"
     "inline without async dispatch.",
+)
+
+NUM_CPU_DEVICES = config.int_flag(
+    name="jax_num_cpu_devices",
+    default=-1,
+    help="Number of CPU devices to use. If not provided, the value of "
+         "the XLA flag --xla_force_host_platform_device_count is used."
+         " Must be set before JAX is initialized.",
 )
 
 
@@ -202,6 +217,9 @@ _plugin_callback_lock = threading.Lock()
 # for unimplemented features. Wrong outputs are not acceptable.
 _nonexperimental_plugins: set[str] = {'cuda', 'rocm'}
 
+# The set of known experimental plugins that have registrations in JAX codebase.
+_experimental_plugins: set[str] = {"METAL"}
+
 def register_backend_factory(name: str, factory: BackendFactory, *,
                              priority: int = 0,
                              fail_quietly: bool = True,
@@ -239,8 +257,8 @@ def make_cpu_client(
   if collectives is None:
     collectives_impl = CPU_COLLECTIVES_IMPLEMENTATION.value
     if _CPU_ENABLE_GLOO_COLLECTIVES.value:
-        collectives_impl = 'gloo'
-        warnings.warn('Setting `jax_cpu_enable_gloo_collectives` is '
+      collectives_impl = 'gloo'
+      warnings.warn('Setting `jax_cpu_enable_gloo_collectives` is '
                       'deprecated. Please use `jax.config.update('
                       '"jax_cpu_collectives_implementation", "gloo")` instead.',
                       DeprecationWarning,
@@ -258,12 +276,22 @@ def make_cpu_client(
                         f"{collectives_impl}. Available implementations are "
                         f"{CPU_COLLECTIVES_IMPLEMENTATIONS}.")
 
+  num_devices = NUM_CPU_DEVICES.value if NUM_CPU_DEVICES.value >= 0 else None
+  if xla_client._version < 303 and num_devices is not None:
+    xla_flags = os.getenv("XLA_FLAGS") or ""
+    os.environ["XLA_FLAGS"] = (
+        f"{xla_flags} --xla_force_host_platform_device_count={num_devices}"
+    )
+    num_devices = None
+  # TODO(phawkins): pass num_devices directly when version 303 is the minimum.
+  kwargs = {} if num_devices is None else {"num_devices": num_devices}
   return xla_client.make_cpu_client(
     asynchronous=_CPU_ENABLE_ASYNC_DISPATCH.value,
     distributed_client=distributed.global_state.client,
     node_id=distributed.global_state.process_id,
     num_nodes=distributed.global_state.num_processes,
     collectives=collectives,
+    **kwargs,
   )
 
 
@@ -422,6 +450,14 @@ def _check_cuda_versions(raise_on_first_error: bool = False,
                        f'following issues with CUDA components:\n'
                        f'{join_str.join(errors)}')
 
+def _get_num_nodes_from_gpu_topology(topology: str) -> int:
+    try:
+      slices_str, hosts_per_slice_str, _ = topology.split("x", 2)
+      return int(slices_str) * int(hosts_per_slice_str)
+    except (IndexError, ValueError):
+      raise ValueError('Mock topology must be of the form '
+                       '"<number-of-slices> x <number-of-hosts-per-slice> x '
+                       '<number-of-devices-per-host>".')
 
 def make_gpu_client(
     *, platform_name: str, visible_devices_flag: config.Flag[str]
@@ -431,12 +467,14 @@ def make_gpu_client(
   if visible_devices != "all":
     allowed_devices = {int(x) for x in visible_devices.split(",")}
 
-  use_mock_gpu_client = _MOCK_NUM_GPU_PROCESSES.value > 0
-  num_nodes = (
-      _MOCK_NUM_GPU_PROCESSES.value
-      if use_mock_gpu_client
-      else distributed.global_state.num_processes
-  )
+  mock_gpu_topology = _MOCK_GPU_TOPOLOGY.value or None
+  mock_num_gpu_processes = (_get_num_nodes_from_gpu_topology(mock_gpu_topology) if
+      mock_gpu_topology else _MOCK_NUM_GPU_PROCESSES.value)
+
+  use_mock_gpu_client = mock_num_gpu_processes > 0
+  num_nodes = (mock_num_gpu_processes if use_mock_gpu_client
+      else distributed.global_state.num_processes)
+
   if platform_name == "cuda":
     if not os.getenv("JAX_SKIP_CUDA_CONSTRAINTS_CHECK"):
       _check_cuda_versions()
@@ -631,10 +669,14 @@ def _options_from_jax_configs(plugin_name):
     visible_devices = CUDA_VISIBLE_DEVICES.value
     if visible_devices != 'all':
       options['visible_devices'] = [int(x) for x in visible_devices.split(',')]
-    mock_gpu_processes = _MOCK_NUM_GPU_PROCESSES.value
-    options['enable_mock_nccl'] = mock_gpu_processes > 0
-    if options['enable_mock_nccl']:
-      options['num_nodes'] = mock_gpu_processes
+    mock_gpu_topology = _MOCK_GPU_TOPOLOGY.value or None
+    mock_num_processes = (_get_num_nodes_from_gpu_topology(mock_gpu_topology) if
+        mock_gpu_topology else _MOCK_NUM_GPU_PROCESSES.value)
+    options['enable_mock_nccl'] = mock_num_processes > 0
+    if mock_num_processes > 0:
+      options['num_nodes'] = mock_num_processes
+      if mock_gpu_topology:
+        options['mock_gpu_topology'] = mock_gpu_topology
 
   return options
 
@@ -774,12 +816,20 @@ for _platform, _alias in _platform_aliases.items():
   _alias_to_platforms.setdefault(_alias, []).append(_platform)
 
 
+def known_platforms() -> set[str]:
+  platforms = set()
+  platforms |= set(_nonexperimental_plugins)
+  platforms |= set(_experimental_plugins)
+  platforms |= set(_backend_factories.keys())
+  platforms |= set(_platform_aliases.values())
+  return platforms
+
+
 def is_known_platform(platform: str) -> bool:
   # A platform is valid if there is a registered factory for it. It does not
   # matter if we were unable to initialize that platform; we only care that
   # we've heard of it and it isn't, e.g., a typo.
-  return (platform in _backend_factories.keys() or
-          platform in _platform_aliases.keys())
+  return platform in known_platforms()
 
 
 def canonicalize_platform(platform: str) -> str:

@@ -20,12 +20,10 @@ import operator
 from functools import partial, lru_cache
 from typing import Any
 
-import numpy as np
-
 from jax._src import core
+from jax._src import config
 from jax._src import dtypes
-from jax._src.abstract_arrays import numpy_scalar_types
-from jax._src.core import ShapedArray
+from jax._src.state.types import AbstractRef
 from jax._src.tree_util import (
     PyTreeDef, tree_flatten, tree_unflatten, tree_map,
     treedef_children, generate_key_paths, keystr, broadcast_prefix,
@@ -68,11 +66,13 @@ def _ensure_str_tuple(x: str | Iterable[str]) -> tuple[str, ...]:
   else:
     return tuple(map(_ensure_str, x))
 
-@lu.transformation_with_aux
-def flatten_fun(in_tree, *args_flat):
+@lu.transformation_with_aux2
+def flatten_fun(f, store, in_tree, *args_flat):
   py_args, py_kwargs = tree_unflatten(in_tree, args_flat)
-  ans = yield py_args, py_kwargs
-  yield tree_flatten(ans)
+  ans = f(*py_args, **py_kwargs)
+  ans, out_tree = tree_flatten(ans)
+  store.store(out_tree)
+  return ans
 
 def apply_flat_fun(fun, io_tree, *py_args):
   in_tree_expected, out_tree = io_tree
@@ -82,11 +82,13 @@ def apply_flat_fun(fun, io_tree, *py_args):
   ans = fun(*args)
   return tree_unflatten(out_tree, ans)
 
-@lu.transformation_with_aux
-def flatten_fun_nokwargs(in_tree, *args_flat):
+@lu.transformation_with_aux2
+def flatten_fun_nokwargs(f, store, in_tree, *args_flat):
   py_args = tree_unflatten(in_tree, args_flat)
-  ans = yield py_args, {}
-  yield tree_flatten(ans)
+  ans = f(*py_args)
+  ans, out_tree = tree_flatten(ans)
+  store.store(out_tree)
+  return ans
 
 def apply_flat_fun_nokwargs(fun, io_tree, py_args):
   in_tree_expected, out_tree = io_tree
@@ -116,19 +118,20 @@ def flattened_fun_in_tree(
   except ValueError:
     return None
   else:
-    return in_tree, lambda: out_tree_store.val, has_kwargs
+    return in_tree, lambda: out_tree_store.val, has_kwargs  # type: ignore[union-attr]
 
-@lu.transformation_with_aux
-def flatten_fun_nokwargs2(in_tree, *args_flat):
+@lu.transformation_with_aux2
+def flatten_fun_nokwargs2(f, store, in_tree, *args_flat):
   py_args = tree_unflatten(in_tree, args_flat)
-  pair = yield py_args, {}
+  pair = f(*py_args)
   if not isinstance(pair, (list, tuple)) or len(pair) != 2:
     raise TypeError("expected function with aux output to return a two-element "
                     f"tuple, but got type {type(pair)} with value {pair!r}")
   ans, aux = pair
   ans_flat, ans_tree = tree_flatten(ans)
   aux_flat, aux_tree = tree_flatten(aux)
-  yield (ans_flat, aux_flat), (ans_tree, aux_tree)
+  store.store((ans_tree, aux_tree))
+  return ans_flat, aux_flat
 
 class _HashableWithStrictTypeEquality:
   """Box object used when comparing static arguments as a jit key.
@@ -277,18 +280,16 @@ def argnums_partial_except(f: lu.WrappedFun, static_argnums: tuple[int, ...],
 
   return _argnums_partial(f, dyn_argnums, tuple(fixed_args)), dyn_args
 
-@lu.transformation
-def _argnums_partial(dyn_argnums, fixed_args, *dyn_args, **kwargs):
+@lu.transformation2
+def _argnums_partial(_fun, _dyn_argnums, _fixed_args, *dyn_args, **kwargs):
   sentinel = object()
-  args = [sentinel] * (len(fixed_args) + len(dyn_args))
-  for i, arg in zip(dyn_argnums, dyn_args):
+  args = [sentinel] * (len(_fixed_args) + len(dyn_args))
+  for i, arg in zip(_dyn_argnums, dyn_args):
     args[i] = arg
-  fixed_args_ = iter(fixed_args)
+  fixed_args_ = iter(_fixed_args)
   args = [next(fixed_args_).val if x is sentinel else x for x in args]
   assert next(fixed_args_, sentinel) is sentinel
-  ans = yield args, kwargs
-  yield ans
-
+  return _fun(*args, **kwargs)
 
 def argnames_partial_except(f: lu.WrappedFun, static_argnames: tuple[str, ...],
                             kwargs: dict[str, Any]):
@@ -311,11 +312,10 @@ def argnames_partial_except(f: lu.WrappedFun, static_argnames: tuple[str, ...],
 
   return _argnames_partial(f, WrapKwArgs(fixed_kwargs)), dyn_kwargs
 
-@lu.transformation
-def _argnames_partial(fixed_kwargs: WrapKwArgs, *args, **dyn_kwargs):
-  kwargs = dict({k: v.val for k, v in fixed_kwargs.val.items()}, **dyn_kwargs)
-  ans = yield args, kwargs
-  yield ans
+@lu.transformation2
+def _argnames_partial(_fun, _fixed_kwargs: WrapKwArgs, *args, **dyn_kwargs):
+  kwargs = dict({k: v.val for k, v in _fixed_kwargs.val.items()}, **dyn_kwargs)
+  return _fun(*args, **kwargs)
 
 
 @lru_cache(maxsize=4096)
@@ -435,10 +435,10 @@ def flat_out_axes(
   f, out_axes = _flat_out_axes(f, tuple(leaves), treedef)
   return f, HashableFunction(out_axes, closure=(tuple(leaves), treedef))
 
-@lu.transformation_with_aux
-def _flat_out_axes(leaves, treedef, *args, **kwargs):
-  ans = yield args, kwargs
-  spec = tree_unflatten(treedef, leaves)
+@lu.transformation_with_aux2
+def _flat_out_axes(_fun, _store, _leaves, _treedef, *args, **kwargs):
+  ans = _fun(*args, **kwargs)
+  spec = tree_unflatten(_treedef, _leaves)
   try:
     spec_flat = tuple(broadcast_prefix(spec, ans, is_leaf=lambda x: x is None))
   except ValueError:
@@ -449,7 +449,8 @@ def _flat_out_axes(leaves, treedef, *args, **kwargs):
             "that the `out_axes` argument to `pmap` is a pytree prefix of the "
             "pmapped function's output.")
     raise ValueError(msg) from None
-  yield ans, spec_flat
+  _store.store(spec_flat)
+  return ans
 
 def check_callable(fun):
   # In Python 3.10+, the only thing stopping us from supporting staticmethods
@@ -582,55 +583,6 @@ def _dtype(x):
   except ValueError:
     return dtypes.result_type(getattr(x, 'dtype'))
 
-def _shaped_abstractify_slow(x):
-  try:
-    return core.raise_to_shaped(
-      x if isinstance(x, core.AbstractValue) else core.get_aval(x))
-  except TypeError:
-    pass
-
-  weak_type = getattr(x, 'weak_type', False)
-  if hasattr(x, 'dtype'):
-    dtype = dtypes.canonicalize_dtype(x.dtype, allow_extended_dtype=True)
-  else:
-    raise TypeError(
-        f"Cannot interpret value of type {type(x)} as an abstract array; it "
-        "does not have a dtype attribute")
-  return core.ShapedArray(np.shape(x), dtype, weak_type=weak_type)
-
-# TODO(mattjj,yashkatariya): replace xla.abstractify with this, same behavior
-def shaped_abstractify(x):
-  handler = _shaped_abstractify_handlers.get(type(x), None)
-  return handler(x) if handler is not None else _shaped_abstractify_slow(x)
-
-_shaped_abstractify_handlers: dict[Any, Callable[[Any], core.ShapedArray]] = {}
-
-
-def _str_abstractify(x):
-  raise TypeError(f"Argument '{x}' of type {type(x)} is not a valid JAX type")
-_shaped_abstractify_handlers[str] = _str_abstractify
-
-def _numpy_array_abstractify(x: np.ndarray) -> ShapedArray:
-  dtype = x.dtype
-  dtypes.check_valid_dtype(dtype)
-  return ShapedArray(x.shape,
-      dtypes.canonicalize_dtype(dtype, allow_extended_dtype=True))
-_shaped_abstractify_handlers[np.ndarray] = _numpy_array_abstractify
-
-def _np_scalar_abstractify(x: np.generic) -> ShapedArray:
-  dtype = np.dtype(x)
-  dtypes.check_valid_dtype(dtype)
-  return ShapedArray(np.shape(x),
-      dtypes.canonicalize_dtype(dtype, allow_extended_dtype=True))
-_shaped_abstractify_handlers.update((t, _np_scalar_abstractify)
-                                    for t in numpy_scalar_types)
-
-def _python_scalar_abstractify(x: int | float | complex | bool) -> ShapedArray:
-  typ = type(x)
-  dtype = dtypes._scalar_type_to_dtype(typ, x)
-  return ShapedArray((), dtype, weak_type=typ in dtypes._weak_types)
-_shaped_abstractify_handlers.update((t, _python_scalar_abstractify)
-                                    for t in dtypes.python_scalar_dtypes)
 
 # This decorator exists to make it easier to monkey-patch APIs in JAX.
 # By default it does nothing, but it can be monkey-patched to do other things.
@@ -639,16 +591,18 @@ def api_hook(fun, tag: str):
 
 
 def debug_info(
-  traced_for: str, src: str | None, fun_signature: inspect.Signature | None,
-  args: tuple[Any, ...], kwargs: dict[str, Any], static_argnums: tuple[int, ...],
-  static_argnames: tuple[str, ...]
+    traced_for: str, fun_src_info: str | None,
+    fun_signature: inspect.Signature | None,
+    args: tuple[Any, ...], kwargs: dict[str, Any],
+    static_argnums: tuple[int, ...],
+    static_argnames: tuple[str, ...]
 ) -> TracingDebugInfo | None:
   """Try to build trace-time debug info for fun when applied to args/kwargs."""
   arg_names = _arg_names(fun_signature, args, kwargs, static_argnums,
                          static_argnames)
   if arg_names is None:
     return None
-  return TracingDebugInfo(traced_for, src, arg_names, None)
+  return TracingDebugInfo(traced_for, fun_src_info, arg_names, None)
 
 def fun_signature(fun: Callable) -> inspect.Signature | None:
   try:
@@ -656,8 +610,17 @@ def fun_signature(fun: Callable) -> inspect.Signature | None:
   except (ValueError, TypeError):
     return None
 
+def save_wrapped_fun_sourceinfo(wrapper: Callable, wrapped: Callable):
+  # Prefer this to functools.wraps because it does not create a reference to
+  # the wrapped function.
+  sourceinfo = fun_sourceinfo(wrapped)
+  if sourceinfo is not None:
+    setattr(wrapper, "__fun_sourceinfo__", fun_sourceinfo(wrapped))
+
 # TODO(mattjj): make this function internal to this module
 def fun_sourceinfo(fun: Callable) -> str | None:
+  res = getattr(fun, "__fun_sourceinfo__", None)
+  if res is not None: return res
   while isinstance(fun, partial):
     fun = fun.func
   fun = inspect.unwrap(fun)
@@ -683,33 +646,36 @@ def _arg_names(fn_signature, args, kwargs, static_argnums, static_argnames,
   return tuple(f'{name}{keystr(path)}' for name, x in ba.arguments.items()
                for path, l in generate_key_paths(x) if l is not static)
 
-@lu.transformation_with_aux
-def result_paths(*args, **kwargs):
+@lu.transformation_with_aux2
+def result_paths(_fun, _store, *args, **kwargs):
   "linear_util transform to get output pytree paths of pre-flattened function."
-  ans = yield args, kwargs
-  yield ans, [keystr(path) for path, _ in generate_key_paths(ans)]
+  ans = _fun(*args, **kwargs)
+  _store.store([keystr(path) for path, _ in generate_key_paths(ans)])
+  return ans
 
-def jaxpr_debug_info(jaxpr: core.Jaxpr, trace_debug: TracingDebugInfo | None,
-                     result_paths: tuple[str, ...] | None = None,
-                     ) -> core.Jaxpr:
+def add_jaxpr_debug_info(jaxpr: core.Jaxpr,
+                         trace_debug: TracingDebugInfo | None,
+                         result_paths: tuple[str, ...] | None = None,
+                         ) -> core.Jaxpr:
   """Add debug info to jaxpr, given trace-time debug info and result paths."""
   if trace_debug is None:
     return jaxpr
-  assert (result_paths is not None) ^ (trace_debug.result_paths is not None)
+  assert (result_paths is not None) ^ (trace_debug.result_paths_thunk is not None)
   if result_paths is None:
-    result_paths = trace_debug.result_paths()  # type: ignore
+    result_paths = trace_debug.result_paths_thunk()  # type: ignore
   debug_info = core.JaxprDebugInfo(
       trace_debug.traced_for, trace_debug.func_src_info,
       trace_debug.arg_names, tuple(result_paths))
   return jaxpr.replace(debug_info=debug_info)
 
 def debug_info_final(f: lu.WrappedFun, dbg: TracingDebugInfo | None,
-                     res_paths: Callable[[], tuple[str, ...]]) -> lu.WrappedFun:
+                     res_paths_thunk: Callable[[], tuple[str, ...]]
+                     ) -> lu.WrappedFun:
   "Attach trace-time debug info and result paths lazy thunk to an lu.WrappedFun"
   if dbg is None: return f
-  assert dbg.result_paths is None
-  res_paths_ = HashableFunction(res_paths, closure=())
-  return lu.add_debug_info(f, dbg._replace(result_paths=res_paths_))
+  assert dbg.result_paths_thunk is None
+  res_paths_thunk_ = HashableFunction(res_paths_thunk, closure=())
+  return lu.add_debug_info(f, dbg._replace(result_paths_thunk=res_paths_thunk_))
 
 
 def hoist_obj_attrs(f, flat_args):
@@ -734,3 +700,31 @@ class _HashableByObjectId:
 def register_class_with_attrs(t: type) -> None:
   _class_with_attrs.add(t)
 _class_with_attrs: set[type] = set()
+
+# TODO(mattjj): make this function faster
+def _check_no_aliased_ref_args(dbg, avals, args):
+  assert config.mutable_array_checks.value
+  refs: dict[int, int] = {}
+  for i, (a, x) in enumerate(zip(avals, args)):
+    if (isinstance(a, AbstractRef) and
+        (dup_idx := refs.setdefault(id(core.get_referent(x)), i)) != i):
+      raise ValueError(
+        "only one reference to a mutable array may be passed as an argument "
+        f"to a function, but when tracing {dbg.func_src_info} for {dbg.traced_for} "
+        f"the mutable array reference of type {a.str_short()} appeared at both "
+        f"{dbg.arg_names[dup_idx]} and {dbg.arg_names[i]}."
+        if dbg else
+        f"at both flat index {dup_idx} and flat index {i}") from None
+
+def _check_no_aliased_closed_over_refs(dbg, consts, args) -> None:
+  assert config.mutable_array_checks.value
+  refs: set[int] = {id(core.get_referent(c)) for c in consts
+                    if isinstance(core.get_aval(c), AbstractRef)}
+  for i, x in enumerate(args):
+    if id(core.get_referent(x)) in refs:
+      a = core.shaped_abstractify(x)
+      raise ValueError(
+          f"when tracing {dbg.func_src_info} for {dbg.traced_for}, a mutable "
+          f"array reference of type {a.str_short()} was both closed over and "
+          f"passed as the argument "
+          f"{dbg.arg_names[i]}" if dbg else "at flat index {i}")

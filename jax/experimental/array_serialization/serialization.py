@@ -29,11 +29,9 @@ from typing import Any, Optional
 
 import jax
 from jax._src import array
-from jax._src import config
 from jax._src import distributed
 from jax._src import sharding
-from jax._src import sharding_impls
-from jax._src.layout import Layout, DeviceLocalLayout as DLL
+from jax._src.layout import Layout
 from jax._src import typing
 from jax._src import util
 from jax._src.lib import xla_extension as xe
@@ -422,10 +420,9 @@ def run_deserialization(shardings: Sequence[sharding.Sharding | Layout],
   async def _run_deserializer():
     # Object should be created once per process.
     byte_limiter = _LimitInFlightBytes(concurrent_bytes)
-
     future_arrays = jax.tree_util.tree_map(
         partial(async_deserialize, byte_limiter=byte_limiter),
-        shardings, tensorstore_specs,
+        list(shardings), list(tensorstore_specs),
         [None] * len(tensorstore_specs) if global_shapes is None else global_shapes,
         [None] * len(tensorstore_specs) if dtypes is None else dtypes)
     return await asyncio.gather(*future_arrays)

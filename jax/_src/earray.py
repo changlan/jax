@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import math
 
-from jax._src import api_util
 from jax._src import basearray
 from jax._src import core
 from jax._src import tree_util
@@ -84,6 +83,10 @@ class EArray(basearray.Array):
     return sharding_impls.logical_sharding(self.aval, phys_sharding)
 
   @property
+  def committed(self):
+    return self._data.committed
+
+  @property
   def device(self):
     if isinstance(self._data.sharding, sharding_impls.SingleDeviceSharding):
       return self._data.device
@@ -104,15 +107,14 @@ class EArray(basearray.Array):
 
 # TODO(mattjj): _set_array_base_attributes
 
-def _earray_shard_arg_handler(xs, shardings, layouts):
+def _earray_shard_arg_handler(xs, shardings, layouts, copy_semantics):
   arrs = [x._data for x in xs]
   phys_shardings = [sharding_impls.physical_sharding(x.aval, sharding)
                     for x, sharding in zip(xs, shardings)]
   # TODO(yashkatariya): `layouts` should be converted to physical layouts.
-  return pxla.shard_args(phys_shardings, layouts, arrs)
+  return pxla.shard_args(phys_shardings, layouts, copy_semantics, arrs)
 pxla.shard_arg_handlers[EArray] = _earray_shard_arg_handler
 
-api_util._shaped_abstractify_handlers[EArray] = lambda self: self.aval
 core.pytype_aval_mappings[EArray] = lambda x: x.aval
 xla.canonicalize_dtype_handlers[EArray] = lambda x: x
 tree_util.dispatch_registry.register_node(

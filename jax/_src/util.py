@@ -376,11 +376,21 @@ def wrap_name(name, transform_name):
   return transform_name + '(' + name + ')'
 
 def fun_name(fun: Callable):
-  return getattr(fun, "__name__", "<unnamed function>")
+  name = getattr(fun, "__name__", None)
+  if name is not None:
+    return name
+  if isinstance(fun, partial):
+    return fun_name(fun.func)
+  else:
+    return "<unnamed function>"
 
 def fun_qual_name(fun: Callable):
-  return getattr(fun, "__qualname__",
-                 getattr(fun, "__name__", "<unnamed function>"))
+  qual_name = getattr(fun, "__qualname__", None)
+  if qual_name is not None:
+    return qual_name
+  if isinstance(fun, partial):
+    return fun_qual_name(fun.func)
+  return fun_name(fun)
 
 def canonicalize_axis(axis, num_dims) -> int:
   """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""
@@ -452,6 +462,10 @@ def tuple_delete(t, idx):
 def tuple_update(t, idx, val):
   assert 0 <= idx < len(t), (idx, len(t))
   return t[:idx] + (val,) + t[idx+1:]
+
+def tuple_replace(tupl, index, item):
+  # unlike tuple_update, works with negative indices as well
+  return tupl[:index] + (item,) + tupl[index:][1:]
 
 class HashableFunction:
   """Decouples function equality and hash from its identity.
@@ -672,3 +686,14 @@ class StrictABCMeta(abc.ABCMeta):
 
 class StrictABC(metaclass=StrictABCMeta):
   __slots__ = ()
+
+
+test_event_listener: Callable | None = None
+
+def test_event(name: str, *args) -> None:
+  if not test_event_listener:
+    return
+  test_event_listener(name, *args)
+
+if hasattr(jaxlib_utils, "Mutex"):
+  Mutex = jaxlib_utils.Mutex

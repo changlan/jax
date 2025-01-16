@@ -19,7 +19,7 @@ load(
     "//jaxlib:jax.bzl",
     "cuda_library",
     "if_cuda_is_configured",
-    "pybind_extension",
+    "nanobind_extension",
 )
 
 licenses(["notice"])
@@ -125,7 +125,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_blas",
     srcs = ["//jaxlib/gpu:blas.cc"],
     copts = [
@@ -173,7 +173,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_rnn",
     srcs = ["//jaxlib/gpu:rnn.cc"],
     copts = [
@@ -265,7 +265,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_solver",
     srcs = ["//jaxlib/gpu:solver.cc"],
     copts = [
@@ -321,7 +321,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_sparse",
     srcs = ["//jaxlib/gpu:sparse.cc"],
     copts = [
@@ -399,7 +399,7 @@ cuda_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_linalg",
     srcs = ["//jaxlib/gpu:linalg.cc"],
     copts = [
@@ -457,7 +457,7 @@ cuda_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_prng",
     srcs = ["//jaxlib/gpu:prng.cc"],
     copts = [
@@ -472,6 +472,56 @@ pybind_extension(
         "//jaxlib:kernel_nanobind_helpers",
         "@local_config_cuda//cuda:cuda_headers",
         "@nanobind",
+        "@xla//xla/tsl/cuda:cudart",
+    ],
+)
+
+cc_library(
+    name = "cuda_hybrid_kernels",
+    srcs = ["//jaxlib/gpu:hybrid_kernels.cc"],
+    hdrs = ["//jaxlib/gpu:hybrid_kernels.h"],
+    deps = [
+        ":cuda_gpu_kernel_helpers",
+        ":cuda_vendor",
+        "//jaxlib:ffi_helpers",
+        "//jaxlib/cpu:lapack_kernels",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/ffi/api:ffi",
+    ],
+)
+
+nanobind_extension(
+    name = "_hybrid",
+    srcs = ["//jaxlib/gpu:hybrid.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    linkopts = select({
+        "@xla//xla/python:use_jax_cuda_pip_rpaths": [
+            "-Wl,-rpath,$$ORIGIN/../../nvidia/cuda_runtime/lib",
+        ],
+        "//conditions:default": [],
+    }),
+    module_name = "_hybrid",
+    deps = [
+        ":cuda_gpu_kernel_helpers",
+        ":cuda_hybrid_kernels",
+        ":cuda_vendor",
+        "//jaxlib:kernel_nanobind_helpers",
+        "//jaxlib/cpu:lapack_kernels",
+        "@com_google_absl//absl/base",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@nanobind",
+        "@xla//xla/ffi/api:ffi",
         "@xla//xla/tsl/cuda:cudart",
     ],
 )
@@ -539,7 +589,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_triton",
     srcs = ["//jaxlib/gpu:triton.cc"],
     copts = [
@@ -590,7 +640,7 @@ cc_library(
     ],
 )
 
-pybind_extension(
+nanobind_extension(
     name = "_versions",
     srcs = ["versions.cc"],
     copts = [
@@ -633,6 +683,7 @@ py_library(
     name = "cuda_gpu_support",
     deps = [
         ":_blas",
+        ":_hybrid",
         ":_linalg",
         ":_prng",
         ":_rnn",

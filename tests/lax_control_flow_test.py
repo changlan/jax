@@ -322,6 +322,19 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       lax.while_loop(lambda c: True, lambda c: (True, True),
                      (np.bool_(True), np.float32(0.)))
 
+  def testWhileLoopCustomPytreeDiffAuxData(self):
+    class Node:
+      def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    tree_util.register_pytree_with_keys(
+        Node,
+        lambda o: ((("x", o.x), ("y", o.y)), 'with_keys'),  # flatten_with_keys
+        lambda _, xy: Node(xy[0], xy[1]),   # unflatten (no key involved)
+        lambda o: ((o.x, o.y), 'without_keys'),    # flatten
+    )
+    lax.while_loop(lambda o: o.x > 0., lambda c: Node(0., 0.), Node(1., 1.))
+
   def testNestedWhileWithDynamicUpdateSlice(self):
     num = 5
 
@@ -575,6 +588,21 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       )
     init = jnp.float32(10)
     self.assertEqual(fori_loop_with_static_upper_and_lower(init), init)
+
+  def test_fori_error_points_to_user_code(self):
+    # See https://github.com/jax-ml/jax/issues/23637
+    def my_body(_, c):
+      return bool(c)
+
+    with self.assertRaisesRegex(
+        jax.errors.TracerBoolConversionError,
+        "occurred while tracing the function my_body at .*control_flow_test.py.* for scan"):
+      jax.lax.fori_loop(0, 5, my_body, 3.)
+
+    with self.assertRaisesRegex(
+        jax.errors.TracerBoolConversionError,
+        "occurred while tracing the function my_body at .*control_flow_test.py.* for while_loop"):
+      jax.jit(lambda ubound: jax.lax.fori_loop(0, ubound, my_body, 3.))(5)
 
   def testForiLoopBatched(self):
     def body_fun(i, loop_carry):
@@ -982,12 +1010,13 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         re.escape("Pred must be a scalar, got (1.0, 1.0) of type <class 'tuple'>")):
       lax.cond((1., 1.), lambda top: 2., lambda fop: 3., 1.)
     with self.assertRaisesRegex(TypeError,
-        re.escape("true_fun and false_fun output must have same type structure, "
-                  f"got {jax.tree.structure(2.)} and {jax.tree.structure((3., 3.))}.")):
-      lax.cond(True, lambda top: 2., lambda fop: (3., 3.), 1.)
+        re.compile("true_fun output must have same type structure "
+                   "as false_fun output, but there are differences:.*"
+                   r"at output\['a'\], true_fun output has pytree leaf", re.DOTALL)):
+      lax.cond(True, lambda top: dict(a=2.), lambda fop: dict(a=(3., 3.)), 1.)
     with self.assertRaisesRegex(
         TypeError,
-        "true_fun and false_fun output must have identical types, got\n"
+        "true_fun output and false_fun output must have identical types, got\n"
         r"DIFFERENT ShapedArray\(float32\[1\]\) vs. "
         r"ShapedArray\(float32\[\].*\)."):
       lax.cond(True,
@@ -1010,16 +1039,17 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         re.escape("Empty branch sequence")):
       lax.switch(0, [], 1.)
     with self.assertRaisesRegex(TypeError,
-        re.escape("branch 0 and 1 outputs must have same type structure, "
-                  f"got {jax.tree.structure(2.)} and {jax.tree.structure((3., 3.))}.")):
-      lax.switch(1, [lambda _: 2., lambda _: (3., 3.)], 1.)
+        re.compile("branch 0 output must have same type structure "
+                   "as branch 1 output, but there are differences:.*"
+                   r"at output\['a'\], branch 0 output has pytree leaf", re.DOTALL)):
+      lax.switch(1, [lambda _: dict(a=2.), lambda _: dict(a=(3., 3.))], 1.)
     with self.assertRaisesRegex(
         TypeError,
-        "branch 0 and 1 outputs must have identical types, got\n"
-        r"DIFFERENT ShapedArray\(float32\[1\]\) "
-        r"vs. ShapedArray\(float32\[\].*\)."):
-      lax.switch(1, [lambda _: jnp.array([1.], jnp.float32),
-                     lambda _: jnp.float32(1.)],
+        "branch 0 output and branch 1 output must have identical types, got\n"
+        r"{'a': 'DIFFERENT ShapedArray\(float32\[1\]\) "
+        r"vs. ShapedArray\(float32\[\].*\)'}."):
+      lax.switch(1, [lambda _: dict(a=jnp.array([1.], jnp.float32)),
+                     lambda _: dict(a=jnp.float32(1.))],
                  1.)
 
   def testCondOneBranchConstant(self):
@@ -1884,6 +1914,16 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         re.escape("scan body output must be a pair, got ShapedArray(float32[]).")):
       lax.scan(lambda c, x: np.float32(0.), 0, jnp.arange(5.))
 
+  def testScanMetadataError(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/25507
+    def f(loop_i, x):
+      return {'T': jnp.array([0.5])}
+
+    init_val = {'t': jnp.array([1.0])}
+    msg = r".*with pytree metadata \('t',\).*with pytree metadata \('T',\)"
+    with self.assertRaisesRegex(TypeError, msg):
+      jax.lax.fori_loop(0, 1, f, init_val)
+
   def testScanBodyCarryPytreeMismatchErrors(self):
     with self.assertRaisesRegex(
         TypeError,
@@ -2095,6 +2135,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     jax.jit(jax.jacfwd(loop, argnums=(0,)))(arg)  # doesn't crash
 
   def testIssue804(self):
+    # https://github.com/google/jax/issues/804
     num_devices = jax.device_count()
     f = partial(lax.scan, lambda c, x: (c + lax.psum(x, "i") , c), 0.)
     jax.pmap(f, axis_name="i")(jnp.ones((num_devices, 4)))  # doesn't crash
@@ -2112,6 +2153,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     expected = jnp.array([])
     self.assertAllClose(ans, expected)
 
+  @jtu.thread_unsafe_test()  # Cache eviction means we might retrace
   def testCaching(self):
     def cond(x):
       assert python_should_be_executing
@@ -2423,6 +2465,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
     scan = lambda c, xs: lax.scan(f, c, xs)
     scan_unrolled = lambda c, xs: lax.scan(f, c, xs, unroll=2)
+    scan_fully_unrolled = lambda c, xs: lax.scan(f, c, xs, unroll=True)
 
     # jaxprs should be the same size
     self.assertEqual(
@@ -2430,9 +2473,19 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         len(str(jax.make_jaxpr(scan_unrolled)(c, xs))))
 
     # but HLO should grow due to unrolling
-    self.assertLess(
-        len(str(jax.jit(scan).lower(c, xs).as_text('hlo'))),
-        len(str(jax.jit(scan_unrolled).lower(c, xs).as_text('hlo'))))
+    scan_hlo = str(jax.jit(scan).lower(c, xs).as_text("hlo"))
+    scan_unrolled_hlo = str(jax.jit(scan_unrolled).lower(c, xs).as_text("hlo"))
+    scan_fully_unrolled_hlo = str(
+        jax.jit(scan_fully_unrolled).lower(c, xs).as_text("hlo"))
+
+    self.assertLess(len(scan_hlo), len(scan_unrolled_hlo))
+    self.assertLess(len(scan_unrolled_hlo), len(scan_fully_unrolled_hlo))
+
+    # and the lowering should contain a while loop, unless the scan is fully
+    # unrolled
+    self.assertIn("while(", scan_hlo)
+    self.assertIn("while(", scan_unrolled_hlo)
+    self.assertNotIn("while(", scan_fully_unrolled_hlo)
 
   def test_scan_xs_none(self):
     def f(h, _):
@@ -2596,7 +2649,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         lax.cond(x, f, g, x)
     # Should observe a maximum of 4 compiles: convert_element_type, f, g, cond
     # In #14058, this was observed to be 31 compiles.
-    self.assertLess(count[0], 5)
+    self.assertLess(count(), 5)
 
   @parameterized.named_parameters(
       {"testcase_name": f"_dtype={dtype.__name__}", "dtype": dtype}
@@ -2996,6 +3049,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertEqual(y, x)
     self.assertIsInstance(y, jax.Array)
 
+  @jtu.thread_unsafe_test()  # live_arrays count isn't thread-safe
   def test_cond_memory_leak(self):
     # https://github.com/jax-ml/jax/issues/12719
 

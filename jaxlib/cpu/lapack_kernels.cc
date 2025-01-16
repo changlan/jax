@@ -64,6 +64,8 @@ REGISTER_CHAR_ENUM_ATTR_DECODING(jax::MatrixParams::Diag);
 REGISTER_CHAR_ENUM_ATTR_DECODING(jax::MatrixParams::UpLo);
 REGISTER_CHAR_ENUM_ATTR_DECODING(jax::svd::ComputationMode);
 REGISTER_CHAR_ENUM_ATTR_DECODING(jax::eig::ComputationMode);
+REGISTER_CHAR_ENUM_ATTR_DECODING(jax::schur::ComputationMode);
+REGISTER_CHAR_ENUM_ATTR_DECODING(jax::schur::Sort);
 
 #undef REGISTER_CHAR_ENUM_ATTR_DECODING
 
@@ -351,6 +353,76 @@ template struct QrFactorization<ffi::DataType::F32>;
 template struct QrFactorization<ffi::DataType::F64>;
 template struct QrFactorization<ffi::DataType::C64>;
 template struct QrFactorization<ffi::DataType::C128>;
+
+//== Column Pivoting QR Factorization ==//
+
+// lapack geqp3
+template <ffi::DataType dtype>
+ffi::Error PivotingQrFactorization<dtype>::Kernel(
+    ffi::Buffer<dtype> x, ffi::Buffer<LapackIntDtype> jpvt,
+    ffi::ResultBuffer<dtype> x_out, ffi::ResultBuffer<LapackIntDtype> jpvt_out,
+    ffi::ResultBuffer<dtype> tau) {
+  FFI_ASSIGN_OR_RETURN((auto [batch_count, x_rows, x_cols]),
+                       SplitBatch2D(x.dimensions()));
+  auto* x_out_data = x_out->typed_data();
+  auto* jpvt_out_data = jpvt_out->typed_data();
+  auto* tau_data = tau->typed_data();
+  lapack_int info;
+  const int64_t work_size = GetWorkspaceSize(x_rows, x_cols);
+  auto work_data = AllocateScratchMemory<dtype>(work_size);
+  constexpr bool is_complex_dtype = ffi::IsComplexType<dtype>();
+  std::unique_ptr<RealType[]> rwork_data;
+  if constexpr (is_complex_dtype) {
+    rwork_data = AllocateScratchMemory<ffi::ToReal(dtype)>(2 * x_cols);
+  }
+
+  CopyIfDiffBuffer(x, x_out);
+  CopyIfDiffBuffer(jpvt, jpvt_out);
+  FFI_ASSIGN_OR_RETURN(auto workspace_dim_v,
+                       MaybeCastNoOverflow<lapack_int>(work_size));
+  FFI_ASSIGN_OR_RETURN(auto x_rows_v, MaybeCastNoOverflow<lapack_int>(x_rows));
+  FFI_ASSIGN_OR_RETURN(auto x_cols_v, MaybeCastNoOverflow<lapack_int>(x_cols));
+  auto x_leading_dim_v = x_rows_v;
+
+  const int64_t x_out_step{x_rows * x_cols};
+  const int64_t jpvt_step{x_cols};
+  const int64_t tau_step{std::min(x_rows, x_cols)};
+  for (int64_t i = 0; i < batch_count; ++i) {
+    if constexpr (is_complex_dtype) {
+      fn(&x_rows_v, &x_cols_v, x_out_data, &x_leading_dim_v, jpvt_out_data,
+         tau_data, work_data.get(), &workspace_dim_v, rwork_data.get(), &info);
+    } else {
+      fn(&x_rows_v, &x_cols_v, x_out_data, &x_leading_dim_v, jpvt_out_data,
+         tau_data, work_data.get(), &workspace_dim_v, &info);
+    }
+    x_out_data += x_out_step;
+    jpvt_out_data += jpvt_step;
+    tau_data += tau_step;
+  }
+  return ffi::Error::Success();
+}
+
+template <ffi::DataType dtype>
+int64_t PivotingQrFactorization<dtype>::GetWorkspaceSize(lapack_int x_rows,
+                                                         lapack_int x_cols) {
+  ValueType optimal_size{};
+  lapack_int x_leading_dim_v = x_rows;
+  lapack_int info = 0;
+  lapack_int workspace_query = -1;
+  if constexpr (ffi::IsComplexType<dtype>()) {
+    fn(&x_rows, &x_cols, nullptr, &x_leading_dim_v, nullptr, nullptr,
+       &optimal_size, &workspace_query, nullptr, &info);
+  } else {
+    fn(&x_rows, &x_cols, nullptr, &x_leading_dim_v, nullptr, nullptr,
+       &optimal_size, &workspace_query, &info);
+  }
+  return info == 0 ? static_cast<int64_t>(std::real(optimal_size)) : -1;
+}
+
+template struct PivotingQrFactorization<ffi::DataType::F32>;
+template struct PivotingQrFactorization<ffi::DataType::F64>;
+template struct PivotingQrFactorization<ffi::DataType::C64>;
+template struct PivotingQrFactorization<ffi::DataType::C128>;
 
 //== Orthogonal QR                                      ==//
 //== Computes orthogonal matrix Q from QR Decomposition ==//
@@ -756,6 +828,35 @@ static ffi::Error SvdKernel(
                               work_data.get(), &workspace_dim_v,
                               iwork_data.get(), info_data);
     }
+
+    // Suppress MSAN warnings when using a copy of LAPACK uninstrumented by
+    // MSAN.
+    using T [[maybe_unused]] = typename svd::SVDType<dtype>::ValueType;
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(info_data, sizeof(*info_data));
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(x_out_data,
+                                        x_cols_v * x_leading_dim_v * sizeof(T));
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+        singular_values_data, std::min(x_rows_v, x_cols_v) * sizeof(RealType));
+    if (mode_v == 'A') {
+      ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+          u_data, u_leading_dim_v * x_rows_v * sizeof(T));
+      ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+          vt_data, vt_leading_dim_v * x_cols_v * sizeof(T));
+    } else if (mode_v == 'O') {
+      if (x_rows_v < x_cols_v) {
+        ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+            u_data, u_leading_dim_v * x_rows_v * sizeof(T));
+      } else {
+        ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+            vt_data, vt_leading_dim_v * x_cols_v * sizeof(T));
+      }
+    } else if (mode_v == 'S') {
+      ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+          u_data, u_leading_dim_v * std::min(x_rows_v, x_cols_v) * sizeof(T));
+      ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(
+          vt_data, vt_leading_dim_v * x_cols_v * sizeof(T));
+    }
+
     x_out_data += x_out_step;
     singular_values_data += singular_values_step;
     u_data += u_step;
@@ -1091,34 +1192,6 @@ template struct EigenvalueDecompositionSymmetric<ffi::DataType::F32>;
 template struct EigenvalueDecompositionSymmetric<ffi::DataType::F64>;
 template struct EigenvalueDecompositionHermitian<ffi::DataType::C64>;
 template struct EigenvalueDecompositionHermitian<ffi::DataType::C128>;
-
-// LAPACK uses a packed representation to represent a mixture of real
-// eigenvectors and complex conjugate pairs. This helper unpacks the
-// representation into regular complex matrices.
-template <typename T>
-static void UnpackEigenvectors(lapack_int n, const T* eigenvals_imag,
-                               const T* packed, std::complex<T>* unpacked) {
-  for (int j = 0; j < n;) {
-    if (eigenvals_imag[j] == 0. || std::isnan(eigenvals_imag[j])) {
-      // Real values in each row without imaginary part
-      // Second row of the imaginary part is not provided
-      for (int i = 0; i < n; ++i) {
-        unpacked[j * n + i] = {packed[j * n + i], 0.};
-      }
-      ++j;
-    } else {
-      // Complex values where the real part is in the jth row
-      // and the imaginary part is in the next row (j + 1)
-      for (int i = 0; i < n; ++i) {
-        const T real_part = packed[j * n + i];
-        const T imag_part = packed[(j + 1) * n + i];
-        unpacked[j * n + i] = {real_part, imag_part};
-        unpacked[(j + 1) * n + i] = {real_part, -imag_part};
-      }
-      j += 2;
-    }
-  }
-}
 
 // lapack geev
 
@@ -1573,6 +1646,180 @@ template struct RealGees<double>;
 template struct ComplexGees<std::complex<float>>;
 template struct ComplexGees<std::complex<double>>;
 
+// FFI Kernel
+
+template <ffi::DataType dtype>
+ffi::Error SchurDecomposition<dtype>::Kernel(
+    ffi::Buffer<dtype> x, schur::ComputationMode mode, schur::Sort sort,
+    ffi::ResultBuffer<dtype> x_out, ffi::ResultBuffer<dtype> schur_vectors,
+    ffi::ResultBuffer<dtype> eigvals_real,
+    ffi::ResultBuffer<dtype> eigvals_imag,
+    // TODO(paruzelp): Sort is not implemented because select function is not
+    // supplied. For that reason, this parameter will always be zero!
+    ffi::ResultBuffer<LapackIntDtype> selected_eigvals,
+    ffi::ResultBuffer<LapackIntDtype> info) {
+  FFI_ASSIGN_OR_RETURN((auto [batch_count, x_rows, x_cols]),
+                       SplitBatch2D(x.dimensions()));
+  if (sort != schur::Sort::kNoSortEigenvalues) {
+    return ffi::Error(
+        ffi::ErrorCode::kUnimplemented,
+        "Ordering eigenvalues on the diagonal is not implemented");
+  }
+
+  CopyIfDiffBuffer(x, x_out);
+
+  // TODO(paruzelp): `select` should be passed as an execution context
+  bool (*select)(ValueType, ValueType) = nullptr;
+  ValueType* x_out_data = x_out->typed_data();
+  ValueType* eigvals_real_data = eigvals_real->typed_data();
+  ValueType* eigvals_imag_data = eigvals_imag->typed_data();
+  ValueType* schur_vectors_data = schur_vectors->typed_data();
+  lapack_int* selected_data = selected_eigvals->typed_data();
+  lapack_int* info_data = info->typed_data();
+
+  auto mode_v = static_cast<char>(mode);
+  auto sort_v = static_cast<char>(sort);
+  FFI_ASSIGN_OR_RETURN(auto x_cols_v, MaybeCastNoOverflow<lapack_int>(x_cols));
+
+  // Prepare LAPACK workspaces.
+  std::unique_ptr<bool[]> bwork =
+      sort != schur::Sort::kNoSortEigenvalues
+          ? AllocateScratchMemory<ffi::DataType::PRED>(x_cols)
+          : nullptr;
+  auto work_size = GetWorkspaceSize(x_cols, mode, sort);
+  FFI_ASSIGN_OR_RETURN(auto work_size_v,
+                       MaybeCastNoOverflow<lapack_int>(work_size));
+  auto work_data = AllocateScratchMemory<dtype>(work_size);
+
+  const int64_t x_size{x_cols * x_cols};
+  [[maybe_unused]] const auto x_size_bytes =
+      static_cast<unsigned long>(x_size) * sizeof(ValueType);
+  [[maybe_unused]] const auto x_cols_bytes =
+      static_cast<unsigned long>(x_cols) * sizeof(ValueType);
+  for (int64_t i = 0; i < batch_count; ++i) {
+    fn(&mode_v, &sort_v, select, &x_cols_v, x_out_data, &x_cols_v,
+       selected_data, eigvals_real_data, eigvals_imag_data, schur_vectors_data,
+       &x_cols_v, work_data.get(), &work_size_v, bwork.get(), info_data);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(x_out_data, x_size_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(selected_data, sizeof(lapack_int));
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(eigvals_real_data, x_cols_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(eigvals_imag_data, x_cols_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(schur_vectors_data, x_size_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(info_data, sizeof(lapack_int));
+
+    x_out_data += x_size;
+    eigvals_real_data += x_cols;
+    eigvals_imag_data += x_cols;
+    schur_vectors_data += x_size;
+    ++selected_data;
+    ++info_data;
+  }
+
+  return ffi::Error::Success();
+}
+
+template <ffi::DataType dtype>
+ffi::Error SchurDecompositionComplex<dtype>::Kernel(
+    ffi::Buffer<dtype> x, schur::ComputationMode mode, schur::Sort sort,
+    ffi::ResultBuffer<dtype> x_out, ffi::ResultBuffer<dtype> schur_vectors,
+    ffi::ResultBuffer<dtype> eigvals,
+    // TODO(paruzelp): Sort is not implemented because select function is not
+    // supplied. For that reason, this parameter will always be zero!
+    ffi::ResultBuffer<LapackIntDtype> selected_eigvals,
+    ffi::ResultBuffer<LapackIntDtype> info) {
+  FFI_ASSIGN_OR_RETURN((auto [batch_count, x_rows, x_cols]),
+                       SplitBatch2D(x.dimensions()));
+  if (sort != schur::Sort::kNoSortEigenvalues) {
+    return ffi::Error(
+        ffi::ErrorCode::kUnimplemented,
+        "Ordering eigenvalues on the diagonal is not implemented");
+  }
+
+  CopyIfDiffBuffer(x, x_out);
+
+  // TODO(paruzelp): `select` should be passed as an execution context
+  bool (*select)(ValueType) = nullptr;
+  ValueType* x_out_data = x_out->typed_data();
+  ValueType* eigvals_data = eigvals->typed_data();
+  ValueType* schur_vectors_data = schur_vectors->typed_data();
+  lapack_int* selected_data = selected_eigvals->typed_data();
+  lapack_int* info_data = info->typed_data();
+
+  auto mode_v = static_cast<char>(mode);
+  auto sort_v = static_cast<char>(sort);
+  FFI_ASSIGN_OR_RETURN(auto x_cols_v, MaybeCastNoOverflow<lapack_int>(x_cols));
+
+  // Prepare LAPACK workspaces.
+  std::unique_ptr<bool[]> bwork =
+      sort != schur::Sort::kNoSortEigenvalues
+          ? AllocateScratchMemory<ffi::DataType::PRED>(x_cols)
+          : nullptr;
+  auto work_size = GetWorkspaceSize(x_cols, mode, sort);
+  FFI_ASSIGN_OR_RETURN(auto work_size_v,
+                       MaybeCastNoOverflow<lapack_int>(work_size));
+  auto work_data = AllocateScratchMemory<dtype>(work_size);
+  auto rwork_data = AllocateScratchMemory<ffi::ToReal(dtype)>(x_cols);
+
+  const int64_t x_size{x_cols * x_cols};
+  [[maybe_unused]] const auto x_size_bytes =
+      static_cast<unsigned long>(x_size) * sizeof(ValueType);
+  [[maybe_unused]] const auto x_cols_bytes =
+      static_cast<unsigned long>(x_cols) * sizeof(ValueType);
+  for (int64_t i = 0; i < batch_count; ++i) {
+    fn(&mode_v, &sort_v, select, &x_cols_v, x_out_data, &x_cols_v,
+       selected_data, eigvals_data, schur_vectors_data, &x_cols_v,
+       work_data.get(), &work_size_v, rwork_data.get(), bwork.get(), info_data);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(eigvals_data, x_cols_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(schur_vectors_data, x_size_bytes);
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(info_data, sizeof(lapack_int));
+    ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(selected_data, sizeof(lapack_int));
+
+    x_out_data += x_size;
+    eigvals_data += x_cols;
+    schur_vectors_data += x_size;
+    ++selected_data;
+    ++info_data;
+  }
+
+  return ffi::Error::Success();
+}
+
+template <ffi::DataType dtype>
+int64_t SchurDecomposition<dtype>::GetWorkspaceSize(lapack_int x_cols,
+                                                    schur::ComputationMode mode,
+                                                    schur::Sort sort) {
+  ValueType optimal_size = {};
+  lapack_int workspace_query = -1;
+  lapack_int info = 0;
+
+  auto mode_v = static_cast<char>(mode);
+  auto sort_v = static_cast<char>(sort);
+  fn(&mode_v, &sort_v, nullptr, &x_cols, nullptr, &x_cols, nullptr, nullptr,
+     nullptr, nullptr, &x_cols, &optimal_size, &workspace_query, nullptr,
+     &info);
+  return info == 0 ? static_cast<int64_t>(std::real(optimal_size)) : -1;
+};
+
+template <ffi::DataType dtype>
+int64_t SchurDecompositionComplex<dtype>::GetWorkspaceSize(
+    lapack_int x_cols, schur::ComputationMode mode, schur::Sort sort) {
+  ValueType optimal_size = {};
+  lapack_int workspace_query = -1;
+  lapack_int info = 0;
+
+  auto mode_v = static_cast<char>(mode);
+  auto sort_v = static_cast<char>(sort);
+  fn(&mode_v, &sort_v, nullptr, &x_cols, nullptr, &x_cols, nullptr, nullptr,
+     nullptr, &x_cols, &optimal_size, &workspace_query, nullptr, nullptr,
+     &info);
+  return info == 0 ? static_cast<int64_t>(std::real(optimal_size)) : -1;
+};
+
+template struct SchurDecomposition<ffi::DataType::F32>;
+template struct SchurDecomposition<ffi::DataType::F64>;
+template struct SchurDecompositionComplex<ffi::DataType::C64>;
+template struct SchurDecompositionComplex<ffi::DataType::C128>;
+
 //== Hessenberg Decomposition ==//
 
 // lapack gehrd
@@ -1741,6 +1988,114 @@ template struct Sytrd<double>;
 template struct Sytrd<std::complex<float>>;
 template struct Sytrd<std::complex<double>>;
 
+// FFI Kernel
+
+template <ffi::DataType dtype>
+ffi::Error TridiagonalReduction<dtype>::Kernel(
+    ffi::Buffer<dtype> x, MatrixParams::UpLo uplo,
+    ffi::ResultBuffer<dtype> x_out,
+    ffi::ResultBuffer<ffi::ToReal(dtype)> diagonal,
+    ffi::ResultBuffer<ffi::ToReal(dtype)> off_diagonal,
+    ffi::ResultBuffer<dtype> tau, ffi::ResultBuffer<LapackIntDtype> info) {
+  FFI_ASSIGN_OR_RETURN((auto [batch_count, x_rows, x_cols]),
+                       SplitBatch2D(x.dimensions()));
+
+  CopyIfDiffBuffer(x, x_out);
+
+  ValueType* x_out_data = x_out->typed_data();
+  RealType* diagonal_data = diagonal->typed_data();
+  RealType* off_diagonal_data = off_diagonal->typed_data();
+  ValueType* tau_data = tau->typed_data();
+  lapack_int* info_data = info->typed_data();
+
+  // Prepare LAPACK workspaces.
+  const auto work_size = GetWorkspaceSize(x_rows, x_cols);
+  auto work_data = AllocateScratchMemory<dtype>(work_size);
+
+  auto uplo_v = static_cast<char>(uplo);
+  FFI_ASSIGN_OR_RETURN(auto x_leading_dim_v,
+                       MaybeCastNoOverflow<lapack_int>(x_rows));
+  FFI_ASSIGN_OR_RETURN(auto work_size_v,
+                       MaybeCastNoOverflow<lapack_int>(work_size));
+  FFI_ASSIGN_OR_RETURN(auto x_order_v, MaybeCastNoOverflow<lapack_int>(x_cols));
+
+  int64_t x_size = x_rows * x_cols;
+  int64_t tau_step = {tau->dimensions().back()};
+  for (int64_t i = 0; i < batch_count; ++i) {
+    fn(&uplo_v, &x_order_v, x_out_data, &x_leading_dim_v, diagonal_data,
+       off_diagonal_data, tau_data, work_data.get(), &work_size_v, info_data);
+    x_out_data += x_size;
+    diagonal_data += x_cols;
+    off_diagonal_data += x_cols - 1;
+    tau_data += tau_step;
+    ++info_data;
+  }
+  return ffi::Error::Success();
+}
+
+template <ffi::DataType dtype>
+int64_t TridiagonalReduction<dtype>::GetWorkspaceSize(lapack_int x_rows,
+                                                      lapack_int x_cols) {
+  ValueType optimal_size = {};
+  lapack_int workspace_query = -1;
+  lapack_int info = 0;
+  char uplo_v = 'L';
+  fn(&uplo_v, &x_cols, nullptr, &x_rows, nullptr, nullptr, nullptr,
+     &optimal_size, &workspace_query, &info);
+  return info == 0 ? static_cast<int64_t>(std::real(optimal_size)) : -1;
+}
+
+template struct TridiagonalReduction<ffi::DataType::F32>;
+template struct TridiagonalReduction<ffi::DataType::F64>;
+template struct TridiagonalReduction<ffi::DataType::C64>;
+template struct TridiagonalReduction<ffi::DataType::C128>;
+
+//== General Tridiagonal System Solver ==//
+
+// lapack gtsv
+
+template <ffi::DataType dtype>
+ffi::Error TridiagonalSolver<dtype>::Kernel(
+    ffi::Buffer<dtype> dl, ffi::Buffer<dtype> d, ffi::Buffer<dtype> du,
+    ffi::Buffer<dtype> b, ffi::ResultBuffer<dtype> dl_out,
+    ffi::ResultBuffer<dtype> d_out, ffi::ResultBuffer<dtype> du_out,
+    ffi::ResultBuffer<dtype> b_out, ffi::ResultBuffer<LapackIntDtype> info) {
+  FFI_ASSIGN_OR_RETURN((auto [batch_count, b_rows, b_cols]),
+                       SplitBatch2D(b.dimensions()));
+
+  CopyIfDiffBuffer(dl, dl_out);
+  CopyIfDiffBuffer(d, d_out);
+  CopyIfDiffBuffer(du, du_out);
+  CopyIfDiffBuffer(b, b_out);
+
+  auto* dl_out_data = dl_out->typed_data();
+  auto* d_out_data = d_out->typed_data();
+  auto* du_out_data = du_out->typed_data();
+  auto* b_out_data = b_out->typed_data();
+  auto* info_data = info->typed_data();
+
+  FFI_ASSIGN_OR_RETURN(auto b_rows_v, MaybeCastNoOverflow<lapack_int>(b_rows));
+  FFI_ASSIGN_OR_RETURN(auto b_cols_v, MaybeCastNoOverflow<lapack_int>(b_cols));
+
+  const int64_t b_out_step{b_rows * b_cols};
+  const int64_t d_step{b_rows};
+  for (int64_t i = 0; i < batch_count; ++i) {
+    fn(&b_rows_v, &b_cols_v, dl_out_data + 1, d_out_data, du_out_data,
+       b_out_data, &b_rows_v, info_data);
+    b_out_data += b_out_step;
+    dl_out_data += d_step;
+    d_out_data += d_step;
+    du_out_data += d_step;
+    ++info_data;
+  }
+  return ffi::Error::Success();
+}
+
+template struct TridiagonalSolver<ffi::DataType::F32>;
+template struct TridiagonalSolver<ffi::DataType::F64>;
+template struct TridiagonalSolver<ffi::DataType::C64>;
+template struct TridiagonalSolver<ffi::DataType::C128>;
+
 // FFI Definition Macros (by DataType)
 
 #define JAX_CPU_DEFINE_TRSM(name, data_type)               \
@@ -1771,6 +2126,16 @@ template struct Sytrd<std::complex<double>>;
       ::xla::ffi::Ffi::Bind()                            \
           .Arg<::xla::ffi::Buffer<data_type>>(/*x*/)     \
           .Ret<::xla::ffi::Buffer<data_type>>(/*x_out*/) \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*tau*/))
+
+#define JAX_CPU_DEFINE_GEQP3(name, data_type)                    \
+  XLA_FFI_DEFINE_HANDLER_SYMBOL(                                 \
+      name, PivotingQrFactorization<data_type>::Kernel,          \
+      ::xla::ffi::Ffi::Bind()                                    \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*x*/)             \
+          .Arg<::xla::ffi::Buffer<LapackIntDtype>>(/*jpvt*/)     \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*x_out*/)         \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*jpvt_out*/) \
           .Ret<::xla::ffi::Buffer<data_type>>(/*tau*/))
 
 #define JAX_CPU_DEFINE_ORGQR(name, data_type)          \
@@ -1864,6 +2229,47 @@ template struct Sytrd<std::complex<double>>;
           .Ret<::xla::ffi::Buffer<data_type>>(/*eigvecs_right*/) \
           .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
 
+#define JAX_CPU_DEFINE_GEES(name, data_type)                             \
+  XLA_FFI_DEFINE_HANDLER_SYMBOL(                                         \
+      name, SchurDecomposition<data_type>::Kernel,                       \
+      ::xla::ffi::Ffi::Bind()                                            \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*x*/)                     \
+          .Attr<schur::ComputationMode>("mode")                          \
+          .Attr<schur::Sort>("sort")                                     \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*x_out*/)                 \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*schur_vectors*/)         \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*eigvals_real*/)          \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*eigvals_imag*/)          \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*selected_eigvals*/) \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
+
+#define JAX_CPU_DEFINE_GEES_COMPLEX(name, data_type)                     \
+  XLA_FFI_DEFINE_HANDLER_SYMBOL(                                         \
+      name, SchurDecompositionComplex<data_type>::Kernel,                \
+      ::xla::ffi::Ffi::Bind()                                            \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*x*/)                     \
+          .Attr<schur::ComputationMode>("mode")                          \
+          .Attr<schur::Sort>("sort")                                     \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*x_out*/)                 \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*schur_vectors*/)         \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*eigvals*/)               \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*selected_eigvals*/) \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
+
+#define JAX_CPU_DEFINE_SYTRD_HETRD(name, data_type)                \
+  XLA_FFI_DEFINE_HANDLER_SYMBOL(                                   \
+      name, TridiagonalReduction<data_type>::Kernel,               \
+      ::xla::ffi::Ffi::Bind()                                      \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*x*/)               \
+          .Attr<MatrixParams::UpLo>("uplo")                        \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*x_out*/)           \
+          .Ret<::xla::ffi::Buffer<::xla::ffi::ToReal(data_type)>>( \
+              /*diagonal*/)                                        \
+          .Ret<::xla::ffi::Buffer<::xla::ffi::ToReal(data_type)>>( \
+              /*off_diagonal*/)                                    \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*tau*/)             \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
+
 #define JAX_CPU_DEFINE_GEHRD(name, data_type)            \
   XLA_FFI_DEFINE_HANDLER_SYMBOL(                         \
       name, HessenbergDecomposition<data_type>::Kernel,  \
@@ -1875,12 +2281,26 @@ template struct Sytrd<std::complex<double>>;
           .Ret<::xla::ffi::Buffer<data_type>>(/*tau*/)   \
           .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
 
+#define JAX_CPU_DEFINE_GTSV(name, data_type)              \
+  XLA_FFI_DEFINE_HANDLER_SYMBOL(                          \
+      name, TridiagonalSolver<data_type>::Kernel,         \
+      ::xla::ffi::Ffi::Bind()                             \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*dl*/)     \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*d*/)      \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*du*/)     \
+          .Arg<::xla::ffi::Buffer<data_type>>(/*b*/)      \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*dl_out*/) \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*d_out*/)  \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*du_out*/) \
+          .Ret<::xla::ffi::Buffer<data_type>>(/*b_out*/)  \
+          .Ret<::xla::ffi::Buffer<LapackIntDtype>>(/*info*/))
+
 // FFI Handlers
 
-JAX_CPU_DEFINE_TRSM(blas_strsm_ffi, ::xla::ffi::DataType::F32);
-JAX_CPU_DEFINE_TRSM(blas_dtrsm_ffi, ::xla::ffi::DataType::F64);
-JAX_CPU_DEFINE_TRSM(blas_ctrsm_ffi, ::xla::ffi::DataType::C64);
-JAX_CPU_DEFINE_TRSM(blas_ztrsm_ffi, ::xla::ffi::DataType::C128);
+JAX_CPU_DEFINE_TRSM(lapack_strsm_ffi, ::xla::ffi::DataType::F32);
+JAX_CPU_DEFINE_TRSM(lapack_dtrsm_ffi, ::xla::ffi::DataType::F64);
+JAX_CPU_DEFINE_TRSM(lapack_ctrsm_ffi, ::xla::ffi::DataType::C64);
+JAX_CPU_DEFINE_TRSM(lapack_ztrsm_ffi, ::xla::ffi::DataType::C128);
 
 JAX_CPU_DEFINE_GETRF(lapack_sgetrf_ffi, ::xla::ffi::DataType::F32);
 JAX_CPU_DEFINE_GETRF(lapack_dgetrf_ffi, ::xla::ffi::DataType::F64);
@@ -1891,6 +2311,11 @@ JAX_CPU_DEFINE_GEQRF(lapack_sgeqrf_ffi, ::xla::ffi::DataType::F32);
 JAX_CPU_DEFINE_GEQRF(lapack_dgeqrf_ffi, ::xla::ffi::DataType::F64);
 JAX_CPU_DEFINE_GEQRF(lapack_cgeqrf_ffi, ::xla::ffi::DataType::C64);
 JAX_CPU_DEFINE_GEQRF(lapack_zgeqrf_ffi, ::xla::ffi::DataType::C128);
+
+JAX_CPU_DEFINE_GEQP3(lapack_sgeqp3_ffi, ::xla::ffi::DataType::F32);
+JAX_CPU_DEFINE_GEQP3(lapack_dgeqp3_ffi, ::xla::ffi::DataType::F64);
+JAX_CPU_DEFINE_GEQP3(lapack_cgeqp3_ffi, ::xla::ffi::DataType::C64);
+JAX_CPU_DEFINE_GEQP3(lapack_zgeqp3_ffi, ::xla::ffi::DataType::C128);
 
 JAX_CPU_DEFINE_ORGQR(lapack_sorgqr_ffi, ::xla::ffi::DataType::F32);
 JAX_CPU_DEFINE_ORGQR(lapack_dorgqr_ffi, ::xla::ffi::DataType::F64);
@@ -1917,14 +2342,30 @@ JAX_CPU_DEFINE_GEEV(lapack_dgeev_ffi, ::xla::ffi::DataType::F64);
 JAX_CPU_DEFINE_GEEV_COMPLEX(lapack_cgeev_ffi, ::xla::ffi::DataType::C64);
 JAX_CPU_DEFINE_GEEV_COMPLEX(lapack_zgeev_ffi, ::xla::ffi::DataType::C128);
 
+JAX_CPU_DEFINE_SYTRD_HETRD(lapack_ssytrd_ffi, ::xla::ffi::DataType::F32);
+JAX_CPU_DEFINE_SYTRD_HETRD(lapack_dsytrd_ffi, ::xla::ffi::DataType::F64);
+JAX_CPU_DEFINE_SYTRD_HETRD(lapack_chetrd_ffi, ::xla::ffi::DataType::C64);
+JAX_CPU_DEFINE_SYTRD_HETRD(lapack_zhetrd_ffi, ::xla::ffi::DataType::C128);
+
+JAX_CPU_DEFINE_GEES(lapack_sgees_ffi, ::xla::ffi::DataType::F32);
+JAX_CPU_DEFINE_GEES(lapack_dgees_ffi, ::xla::ffi::DataType::F64);
+JAX_CPU_DEFINE_GEES_COMPLEX(lapack_cgees_ffi, ::xla::ffi::DataType::C64);
+JAX_CPU_DEFINE_GEES_COMPLEX(lapack_zgees_ffi, ::xla::ffi::DataType::C128);
+
 JAX_CPU_DEFINE_GEHRD(lapack_sgehrd_ffi, ::xla::ffi::DataType::F32);
 JAX_CPU_DEFINE_GEHRD(lapack_dgehrd_ffi, ::xla::ffi::DataType::F64);
 JAX_CPU_DEFINE_GEHRD(lapack_cgehrd_ffi, ::xla::ffi::DataType::C64);
 JAX_CPU_DEFINE_GEHRD(lapack_zgehrd_ffi, ::xla::ffi::DataType::C128);
 
+JAX_CPU_DEFINE_GTSV(lapack_sgtsv_ffi, ::xla::ffi::DataType::F32);
+JAX_CPU_DEFINE_GTSV(lapack_dgtsv_ffi, ::xla::ffi::DataType::F64);
+JAX_CPU_DEFINE_GTSV(lapack_cgtsv_ffi, ::xla::ffi::DataType::C64);
+JAX_CPU_DEFINE_GTSV(lapack_zgtsv_ffi, ::xla::ffi::DataType::C128);
+
 #undef JAX_CPU_DEFINE_TRSM
 #undef JAX_CPU_DEFINE_GETRF
 #undef JAX_CPU_DEFINE_GEQRF
+#undef JAX_CPU_DEFINE_GEQP3
 #undef JAX_CPU_DEFINE_ORGQR
 #undef JAX_CPU_DEFINE_POTRF
 #undef JAX_CPU_DEFINE_GESDD
@@ -1933,6 +2374,10 @@ JAX_CPU_DEFINE_GEHRD(lapack_zgehrd_ffi, ::xla::ffi::DataType::C128);
 #undef JAX_CPU_DEFINE_HEEVD
 #undef JAX_CPU_DEFINE_GEEV
 #undef JAX_CPU_DEFINE_GEEV_COMPLEX
+#undef JAX_CPU_DEFINE_SYTRD_HETRD
+#undef JAX_CPU_DEFINE_GEES
+#undef JAX_CPU_DEFINE_GEES_COMPLEX
 #undef JAX_CPU_DEFINE_GEHRD
+#undef JAX_CPU_DEFINE_GTSV
 
 }  // namespace jax

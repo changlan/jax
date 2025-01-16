@@ -14,8 +14,6 @@
 
 import os
 import platform
-import time
-import warnings
 
 from absl import logging
 from absl.testing import absltest
@@ -25,7 +23,6 @@ from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
-from jax._src.interpreters import xla
 from jax._src.lib import xla_client as xc
 
 config.parse_flags_with_absl()
@@ -120,50 +117,12 @@ class XlaBridgeTest(jtu.JaxTestCase):
     # Map order does not matter.
     self.assertEqual(c1str, c2.SerializeAsString())
 
-  def test_parameter_replication_default(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()))
-    built_c = c.Build()
-    assert "replication" not in built_c.as_hlo_text()
-
-  def test_parameter_replication(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()), "",
-                     False)
-    built_c = c.Build()
-    assert "parameter_replication={false}" in built_c.as_hlo_text()
-
   def test_local_devices(self):
     self.assertNotEmpty(xb.local_devices())
     with self.assertRaisesRegex(ValueError, "Unknown process_index 100"):
       xb.local_devices(100)
     with self.assertRaisesRegex(RuntimeError, "Unknown backend foo"):
       xb.local_devices(backend="foo")
-
-  def test_timer_tpu_warning(self):
-    with warnings.catch_warnings(record=True) as w:
-      warnings.simplefilter("always")
-
-      def _mock_tpu_client_with_options(library_path=None, options=None):
-        time_to_wait = 5
-        start = time.time()
-        while not w:
-          if time.time() - start > time_to_wait:
-            raise ValueError(
-                "This test should not hang for more than "
-                f"{time_to_wait} seconds.")
-          time.sleep(0.1)
-
-        self.assertLen(w, 1)
-        msg = str(w[-1].message)
-        self.assertIn("Did you run your code on all TPU hosts?", msg)
-
-      def _mock_tpu_client(library_path=None):
-        _mock_tpu_client_with_options(library_path=library_path, options=None)
-
-      with mock.patch.object(xc, "make_tpu_client",
-                            side_effect=_mock_tpu_client_with_options):
-        xb.tpu_client_timer_callback(0.01)
 
   def test_register_plugin(self):
     with self.assertLogs(level="WARNING") as log_output:

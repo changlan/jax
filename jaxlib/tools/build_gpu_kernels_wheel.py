@@ -108,6 +108,7 @@ def prepare_wheel_cuda(
           f"__main__/jaxlib/cuda/_rnn.{pyext}",
           f"__main__/jaxlib/cuda/_sparse.{pyext}",
           f"__main__/jaxlib/cuda/_triton.{pyext}",
+          f"__main__/jaxlib/cuda/_hybrid.{pyext}",
           f"__main__/jaxlib/cuda/_versions.{pyext}",
           f"__main__/jaxlib/cuda_plugin_extension.{pyext}",
           f"__main__/jaxlib/mosaic/gpu/_mosaic_gpu_ext.{pyext}",
@@ -139,11 +140,13 @@ def prepare_wheel_rocm(
   copy_runfiles(
       dst_dir=plugin_dir,
       src_files=[
-          f"__main__/jaxlib/rocm/_solver.{pyext}",
           f"__main__/jaxlib/rocm/_blas.{pyext}",
           f"__main__/jaxlib/rocm/_linalg.{pyext}",
           f"__main__/jaxlib/rocm/_prng.{pyext}",
+          f"__main__/jaxlib/rocm/_solver.{pyext}",
           f"__main__/jaxlib/rocm/_sparse.{pyext}",
+          f"__main__/jaxlib/rocm/_hybrid.{pyext}",
+          f"__main__/jaxlib/rocm/_rnn.{pyext}",
           f"__main__/jaxlib/rocm/_triton.{pyext}",
           f"__main__/jaxlib/rocm_plugin_extension.{pyext}",
           "__main__/jaxlib/version.py",
@@ -171,11 +174,12 @@ try:
   if args.editable:
     build_utils.build_editable(sources_path, args.output_path, package_name)
   else:
+    git_hash = build_utils.get_githash(args.jaxlib_git_hash)
     build_utils.build_wheel(
         sources_path,
         args.output_path,
         package_name,
-        git_hash=args.jaxlib_git_hash,
+        git_hash=git_hash,
     )
 finally:
   tmpdir.cleanup()

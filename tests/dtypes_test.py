@@ -64,6 +64,10 @@ custom_float_dtypes = [np.dtype(dtypes.bfloat16)]
 fp8_dtypes = [np.dtype(dtypes.float8_e4m3b11fnuz), np.dtype(dtypes.float8_e4m3fn),
               np.dtype(dtypes.float8_e4m3fnuz), np.dtype(dtypes.float8_e5m2),
               np.dtype(dtypes.float8_e5m2fnuz)]
+if dtypes.float8_e3m4 is not None:
+  fp8_dtypes += [np.dtype(dtypes.float8_e3m4)]
+if dtypes.float8_e4m3 is not None:
+  fp8_dtypes += [np.dtype(dtypes.float8_e4m3)]
 float_dtypes += fp8_dtypes
 custom_float_dtypes += fp8_dtypes
 
@@ -777,6 +781,12 @@ class TestPromotionTables(jtu.JaxTestCase):
       {"testcase_name": f"_{jaxtype=}", "jaxtype": jaxtype}
       for jaxtype in dtypes._jax_types + dtypes._weak_types)
   def testJaxTypeFromVal(self, jaxtype):
+    from jax._src.export import shape_poly
+    if jaxtype is shape_poly._DimExpr:
+      # _DimExpr is actually totally fine - shape_poly registers it as
+      # fully polymorphic with integers, this is really more about the fact
+      # that the test here isn't relevant - not in how
+      self.skipTest("2+ year old bug, b/389681440")
     try:
       val = jaxtype(0)
     except TypeError:

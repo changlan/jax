@@ -18,11 +18,11 @@ from collections import Counter
 from functools import partial
 import logging
 import math
+import os
 import platform
 import unittest
 from unittest import mock
 from unittest import SkipTest
-import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -38,8 +38,10 @@ from jax._src import distributed
 from jax._src import monitoring
 from jax._src import path as pathlib
 from jax._src import test_util as jtu
+from jax._src import test_warning_util
 from jax._src import xla_bridge
 from jax._src.compilation_cache_interface import CacheInterface
+from jax._src.lib import xla_client as xc
 from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as P
 import numpy as np
@@ -50,17 +52,11 @@ config.parse_flags_with_absl()
 FAKE_COMPILE_TIME = 10
 _counts = Counter()  # Map event name to count
 
-
-def setUpModule():
-  monitoring.register_event_listener(increment_event_count)
-
-
-def tearDownModule():
-  monitoring._unregister_event_listener_by_callback(increment_event_count)
-
-
 def increment_event_count(event):
   _counts[event] += 1
+
+monitoring.register_event_listener(increment_event_count)
+
 
 def msg_exists_in_logs(msg: str, records: list[logging.LogRecord],
                        level: int | None = None) -> bool:
@@ -99,6 +95,7 @@ def clear_cache() -> None:
     cc._cache.clear()
 
 
+@jtu.thread_unsafe_test_class()  # mocking isn't thread-safe
 class CompilationCacheTestCase(jtu.JaxTestCase):
 
   def setUp(self):
@@ -236,21 +233,20 @@ class CompilationCacheTest(CompilationCacheTestCase):
     with (
       config.raise_persistent_cache_errors(False),
       mock.patch.object(cc._get_cache(backend).__class__, "put") as mock_put,
-      warnings.catch_warnings(record=True) as w,
+      test_warning_util.record_warnings() as w,
     ):
-      warnings.simplefilter("always")
       mock_put.side_effect = RuntimeError("test error")
       self.assertEqual(f(2).item(), 4)
-      if len(w) != 1:
-        print("Warnings:", [str(w_) for w_ in w], flush=True)
-      self.assertLen(w, 1)
-      self.assertIn(
-          (
-              "Error writing persistent compilation cache entry "
-              "for 'jit__lambda_': RuntimeError: test error"
-          ),
-          str(w[0].message),
-      )
+    if len(w) != 1:
+      print("Warnings:", [str(w_) for w_ in w], flush=True)
+    self.assertLen(w, 1)
+    self.assertIn(
+        (
+            "Error writing persistent compilation cache entry "
+            "for 'jit__lambda_': RuntimeError: test error"
+        ),
+        str(w[0].message),
+    )
 
   def test_cache_read_warning(self):
     f = jit(lambda x: x * x)
@@ -259,23 +255,22 @@ class CompilationCacheTest(CompilationCacheTestCase):
     with (
       config.raise_persistent_cache_errors(False),
       mock.patch.object(cc._get_cache(backend).__class__, "get") as mock_get,
-      warnings.catch_warnings(record=True) as w,
+      test_warning_util.record_warnings() as w,
     ):
-      warnings.simplefilter("always")
       mock_get.side_effect = RuntimeError("test error")
       # Calling assertEqual with the jitted f will generate two PJIT
       # executables: Equal and the lambda function itself.
       self.assertEqual(f(2).item(), 4)
-      if len(w) != 1:
-        print("Warnings:", [str(w_) for w_ in w], flush=True)
-      self.assertLen(w, 1)
-      self.assertIn(
-          (
-              "Error reading persistent compilation cache entry "
-              "for 'jit__lambda_': RuntimeError: test error"
-          ),
-          str(w[0].message),
-      )
+    if len(w) != 1:
+      print("Warnings:", [str(w_) for w_ in w], flush=True)
+    self.assertLen(w, 1)
+    self.assertIn(
+        (
+            "Error reading persistent compilation cache entry "
+            "for 'jit__lambda_': RuntimeError: test error"
+        ),
+        str(w[0].message),
+    )
 
   def test_min_entry_size(self):
     with (
@@ -420,6 +415,8 @@ class CompilationCacheTest(CompilationCacheTestCase):
       self.assertFalse(msg_exists_in_logs(msg, log.records, logging.WARNING))
 
   def test_persistent_cache_miss_logging_with_explain(self):
+    if config.use_shardy_partitioner.value:
+      self.skipTest("TODO(b/364547005): pure callbacks not supported by Shardy yet")
     with (config.explain_cache_misses(True),
           config.compilation_cache_dir("jax-cache")):
 
@@ -464,6 +461,8 @@ class CompilationCacheTest(CompilationCacheTestCase):
 
   def test_persistent_cache_miss_logging_with_no_explain(self):
     # test that cache failure messages do not get logged in WARNING
+    if config.use_shardy_partitioner.value:
+      self.skipTest("TODO(b/364547005): pure callbacks not supported by Shardy yet")
     with (config.explain_cache_misses(False),
           config.compilation_cache_dir("jax-cache")):
       # omitting writing to cache because compilation is too fast
@@ -531,6 +530,43 @@ class CompilationCacheTest(CompilationCacheTestCase):
     self.assertEqual(
         executable.fingerprint, deserialized_executable.fingerprint)
 
+  def test_persistent_cache_enable_xla_caches(self):
+    if jtu.jaxlib_version() <= (0, 4, 35):
+      self.skipTest("Test requires AutotuneCacheMode bindings")
+    s = os.sep
+    with config.compilation_cache_dir("jax-cache"):
+      with config.persistent_cache_enable_xla_caches("none"):
+        compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+        )
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_kernel_cache_file, "")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_enable_llvm_module_compilation_parallelism, False)
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir, "")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_experimental_autotune_cache_mode, xc.AutotuneCacheMode.UPDATE)
+      with config.persistent_cache_enable_xla_caches("all"):
+        compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+        )
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_kernel_cache_file, f"jax-cache{s}xla_gpu_kernel_cache_file")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_enable_llvm_module_compilation_parallelism, True)
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir, f"jax-cache{s}xla_gpu_per_fusion_autotune_cache_dir")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_experimental_autotune_cache_mode, xc.AutotuneCacheMode.UPDATE)
+      with config.persistent_cache_enable_xla_caches("xla_gpu_kernel_cache_file"):
+        compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+        )
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_kernel_cache_file, f"jax-cache{s}xla_gpu_kernel_cache_file")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_enable_llvm_module_compilation_parallelism, True)
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir, "")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_experimental_autotune_cache_mode, xc.AutotuneCacheMode.UPDATE)
+      with config.persistent_cache_enable_xla_caches("xla_gpu_per_fusion_autotune_cache_dir"):
+        compile_options = compiler.get_compile_options(
+          num_replicas=1, num_partitions=1
+        )
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_kernel_cache_file, "")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_enable_llvm_module_compilation_parallelism, False)
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir, f"jax-cache{s}xla_gpu_per_fusion_autotune_cache_dir")
+        self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_experimental_autotune_cache_mode, xc.AutotuneCacheMode.UPDATE)
 
 @jtu.with_config(
     jax_enable_compilation_cache=False,
@@ -565,6 +601,18 @@ class CompilationCacheDisabledTest(CompilationCacheTestCase):
       count_after_second_use = _counts[
           "/jax/compilation_cache/task_disabled_cache"]
       self.assertEqual(count_after_second_use, count_after_first_use)
+
+  def test_persistent_cache_enable_xla_caches_disabled(self):
+    if jtu.jaxlib_version() <= (0, 4, 35):
+      self.skipTest("Test requires AutotuneCacheMode bindings")
+    with config.enable_compilation_cache(False):
+      compile_options = compiler.get_compile_options(
+        num_replicas=1, num_partitions=1
+      )
+      self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_kernel_cache_file, "")
+      self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_enable_llvm_module_compilation_parallelism, False)
+      self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_per_fusion_autotune_cache_dir, "")
+      self.assertEqual(compile_options.executable_build_options.debug_options.xla_gpu_experimental_autotune_cache_mode, xc.AutotuneCacheMode.UPDATE)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())
